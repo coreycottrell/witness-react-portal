@@ -1,0 +1,76 @@
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: var(--header-height);
+  padding: 0 20px;
+  background: var(--bg-secondary);
+  border-bottom: 2px solid transparent;
+  border-image: var(--gradient-brand) 1;
+  flex-shrink: 0;
+}
+
+.header-left {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.header-brand-link {
+  text-decoration: none !important;
+}
+
+.header-title {
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  background: var(--gradient-brand);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.header-subtitle {
+  font-size: 13px;
+  color: var(--text-tertiary);
+  font-weight: 500;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* ── Mini ring context indicator ──────────────────────── */
+
+.header-ctx-link {
+  display: flex;
+  align-items: center;
+  text-decoration: none;
+  border-radius: 50%;
+  transition: transform var(--transition-fast);
+  cursor: pointer;
+}
+
+.header-ctx-link:hover {
+  transform: scale(1.15);
+}
+
+.header-ctx-ring {
+  display: block;
+}
+
+.header-ctx-ring-text {
+  font-family: var(--font-mono);
+  font-size: 8px;
+  font-weight: 700;
+}
+
+@media (max-width: 768px) {
+  .header {
+    padding: 0 12px;
+  }
+}

@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+react-portal/node_modules/
+
+# Build output
+dist/
+react-portal/dist/
+
+# Sensitive files
+.portal-token
+.fleet-secret
+.portal-human-auth
+portal_owner.json
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Chat/runtime data
+portal-chat.jsonl
+boop_config.json
+
+# Editor
+.DS_Store
+*.swp

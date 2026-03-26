@@ -1,0 +1,405 @@
+/* Witness-specific styles — scoped to .witness-* classes */
+
+.witness-panel {
+  padding: 1.5rem;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.witness-panel__title {
+  font-size: 1.25rem;
+  font-weight: 600;
+  margin-bottom: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.witness-panel--error {
+  color: var(--color-error, #ef4444);
+}
+
+.witness-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+}
+
+.witness-table th,
+.witness-table td {
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+  border-bottom: 1px solid var(--color-border, #e5e7eb);
+}
+
+.witness-table th {
+  font-weight: 600;
+  background: var(--color-surface, #f9fafb);
+}
+
+.witness-status--running { color: #22c55e; }
+.witness-status--stopped { color: #ef4444; }
+.witness-status--exited  { color: #f97316; }
+
+.witness-health--healthy   { color: #22c55e; }
+.witness-health--unhealthy { color: #ef4444; }
+.witness-health--unknown   { color: #9ca3af; }
+
+.witness-positive { color: #22c55e; }
+.witness-negative { color: #ef4444; }
+
+.witness-totals {
+  display: flex;
+  gap: 2rem;
+  margin-bottom: 1rem;
+  font-size: 0.875rem;
+}
+
+.witness-badge {
+  background: #ef4444;
+  color: white;
+  border-radius: 9999px;
+  padding: 0.125rem 0.5rem;
+  font-size: 0.75rem;
+}
+
+.witness-empty {
+  color: var(--color-muted, #6b7280);
+  font-style: italic;
+}
+
+.witness-alerts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.witness-alert {
+  border: 1px solid var(--color-border, #e5e7eb);
+  border-radius: 0.5rem;
+  padding: 0.75rem 1rem;
+}
+
+.witness-alert--critical { border-left: 4px solid #ef4444; }
+.witness-alert--warning  { border-left: 4px solid #f97316; }
+.witness-alert--info     { border-left: 4px solid #3b82f6; }
+.witness-alert--acked    { opacity: 0.5; }
+
+.witness-alert__header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.25rem;
+}
+
+.witness-alert__severity {
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.witness-alert__title {
+  font-weight: 600;
+  flex: 1;
+}
+
+.witness-alert__time {
+  font-size: 0.75rem;
+  color: var(--color-muted, #6b7280);
+}
+
+.witness-alert__body {
+  font-size: 0.875rem;
+  margin-bottom: 0.5rem;
+  color: var(--color-muted, #6b7280);
+}
+
+.witness-btn {
+  border: 1px solid var(--color-border, #e5e7eb);
+  background: transparent;
+  border-radius: 0.375rem;
+  cursor: pointer;
+  font-size: 0.875rem;
+  padding: 0.25rem 0.75rem;
+  transition: background 0.15s;
+}
+
+.witness-btn:hover {
+  background: var(--color-surface, #f9fafb);
+}
+
+.witness-btn--sm {
+  font-size: 0.75rem;
+  padding: 0.2rem 0.6rem;
+}
+
+/* ═══════════════════════════════════════════════════════
+   The Living Margin — shared journal between voices
+   ═══════════════════════════════════════════════════════ */
+
+.margin-panel {
+  padding: 2rem 1.5rem;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+/* Header — warm and inviting */
+.margin-header {
+  text-align: center;
+  margin-bottom: 2rem;
+  padding-bottom: 1.5rem;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.margin-title {
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  background: var(--gradient-brand);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.margin-subtitle {
+  font-size: 0.8rem;
+  color: var(--text-tertiary);
+  margin-top: 0.25rem;
+  font-style: italic;
+  letter-spacing: 0.02em;
+}
+
+.margin-loading {
+  text-align: center;
+  color: var(--text-tertiary);
+  font-style: italic;
+  padding: 3rem 0;
+}
+
+.margin-error {
+  background: var(--status-error-bg);
+  color: var(--status-error);
+  border: 1px solid var(--status-error);
+  border-radius: var(--radius-md);
+  padding: 0.75rem 1rem;
+  font-size: 0.875rem;
+  margin-bottom: 1.5rem;
+}
+
+/* Two-column dialogue */
+.margin-dialogue {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2rem;
+}
+
+/* Each voice */
+.margin-voice {
+  min-width: 0;
+}
+
+.margin-voice-label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-tertiary);
+  margin-bottom: 1rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.margin-voice-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-full);
+  flex-shrink: 0;
+}
+
+.margin-voice-dot--witness {
+  background: var(--accent-primary);
+  box-shadow: 0 0 6px var(--accent-primary);
+}
+
+.margin-voice-dot--corey {
+  background: var(--accent-secondary);
+  box-shadow: 0 0 6px var(--accent-secondary);
+}
+
+/* Entry cards */
+.margin-entries {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.margin-card {
+  background: var(--surface-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: 1rem 1.25rem;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.margin-card:hover {
+  border-color: var(--border-default);
+}
+
+.margin-card--witness {
+  border-left: 3px solid var(--accent-primary);
+}
+
+.margin-card--corey {
+  border-left: 3px solid var(--accent-secondary);
+}
+
+.margin-card-body {
+  font-size: 0.875rem;
+  line-height: 1.65;
+  color: var(--text-primary);
+}
+
+/* Markdown inside cards */
+.margin-card-body p {
+  margin: 0 0 0.5em;
+}
+
+.margin-card-body p:last-child {
+  margin-bottom: 0;
+}
+
+.margin-card-body strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.margin-card-body ul,
+.margin-card-body ol {
+  margin: 0.25em 0 0.5em 1.25em;
+  padding: 0;
+}
+
+.margin-card-body li {
+  margin-bottom: 0.2em;
+}
+
+.margin-card-body code {
+  font-family: var(--font-mono);
+  font-size: 0.8em;
+  background: var(--bg-tertiary);
+  padding: 0.15em 0.35em;
+  border-radius: var(--radius-sm);
+}
+
+.margin-card-body blockquote {
+  border-left: 2px solid var(--border-default);
+  padding-left: 0.75em;
+  margin: 0.5em 0;
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.margin-card-body a {
+  color: var(--accent-primary);
+}
+
+/* Timestamp — subtle, at the bottom */
+.margin-time {
+  display: block;
+  font-size: 0.7rem;
+  color: var(--text-tertiary);
+  margin-top: 0.75rem;
+  cursor: default;
+}
+
+.margin-empty {
+  color: var(--text-tertiary);
+  font-style: italic;
+  font-size: 0.875rem;
+  padding: 1.5rem 0;
+  text-align: center;
+}
+
+/* Compose area — inviting, not clinical */
+.margin-compose {
+  background: var(--surface-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: 1rem;
+  margin-bottom: 1.25rem;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.margin-compose:focus-within {
+  border-color: var(--accent-secondary);
+  box-shadow: 0 0 0 3px var(--accent-secondary-bg);
+}
+
+.margin-input {
+  width: 100%;
+  min-height: 80px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 0.875rem;
+  resize: vertical;
+  line-height: 1.6;
+  outline: none;
+}
+
+.margin-input::placeholder {
+  color: var(--text-tertiary);
+  font-style: italic;
+}
+
+.margin-compose-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.margin-hint {
+  font-size: 0.7rem;
+  color: var(--text-tertiary);
+}
+
+.margin-post-btn {
+  background: var(--accent-secondary);
+  color: var(--text-inverse);
+  border: none;
+  border-radius: var(--radius-md);
+  padding: 0.5rem 1.25rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--transition-fast), opacity var(--transition-fast);
+}
+
+.margin-post-btn:hover:not(:disabled) {
+  background: var(--accent-primary);
+}
+
+.margin-post-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+@media (max-width: 700px) {
+  .margin-dialogue {
+    grid-template-columns: 1fr;
+    gap: 1.5rem;
+  }
+
+  .margin-panel {
+    padding: 1.25rem 1rem;
+  }
+}
