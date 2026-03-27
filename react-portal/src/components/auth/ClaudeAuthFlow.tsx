@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef } from 'react'
 import { apiGet, apiPost } from '../../api/client'
+import { fireFirstBoot } from '../../api/evolution'
 import './ClaudeAuthFlow.css'
 
 interface AuthStatus {
@@ -9,7 +10,7 @@ interface AuthStatus {
   needs_human_auth?: boolean
 }
 
-type FlowStep = 'idle' | 'starting' | 'polling_url' | 'waiting_code' | 'submitting' | 'done'
+type FlowStep = 'idle' | 'starting' | 'polling_url' | 'waiting_code' | 'submitting' | 'firing_evolution' | 'done'
 
 export function ClaudeAuthFlow() {
   const [status, setStatus] = useState<AuthStatus | null>(null)
@@ -66,11 +67,17 @@ export function ClaudeAuthFlow() {
     setError(null)
     try {
       await apiPost('/api/auth/code', { code: code.trim() })
-      // Poll status until authenticated
+      // Poll status until authenticated, then fire evolution
       pollRef.current = setInterval(async () => {
         const s = await fetchStatus()
         if (s?.authenticated) {
           clearInterval(pollRef.current!)
+          setStep('firing_evolution')
+          try {
+            await fireFirstBoot()
+          } catch {
+            setError('Auth succeeded but failed to start evolution. Refresh and try again.')
+          }
           setStep('done')
         }
       }, 2000)
@@ -147,9 +154,13 @@ export function ClaudeAuthFlow() {
           <p className="claude-auth-status">Submitting code... verifying with Anthropic...</p>
         )}
 
+        {step === 'firing_evolution' && (
+          <p className="claude-auth-status">Authenticated! Starting evolution...</p>
+        )}
+
         {step === 'done' && (
           <p className="claude-auth-status claude-auth-success">
-            Claude authenticated successfully! Reloading...
+            Authenticated successfully! Your AiCIV is waking up...
           </p>
         )}
       </div>
