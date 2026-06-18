@@ -2921,6 +2921,9 @@
       })
       .then(function() {
         token = t;
+        // Persist whatever token authenticated (per-operator token included) so
+        // it survives a client/mobile refresh. Without this, a refresh fell back
+        // to a stale legacy token and operator attribution was lost. (opfix 2026-06-18)
         localStorage.setItem('portal_token', t);
         overlay.classList.add('hidden');
         document.body.classList.remove('login-active');
@@ -2943,19 +2946,26 @@
     location.reload();
   });
 
+  // Token-persistence fix (opfix 2026-06-18):
+  // A URL ?token= (per-operator token) is AUTHORITATIVE — persist it immediately,
+  // overwriting any stale legacy token in localStorage, BEFORE booting. Previously
+  // a present urlToken was used in memory only (never written) when a saved token
+  // already existed, so a refresh dropped the per-op token and fell back to the
+  // legacy token, losing operator attribution (Russell's msgs read as [operator]).
+  // On refresh (no urlToken) we always boot from the persisted token.
   var saved = localStorage.getItem('portal_token');
-  if (saved) {
+  if (urlToken) {
+    // Per-op (or any URL) token wins and is persisted so it survives refresh.
+    token = urlToken;
+    tokenInput.value = urlToken;
+    localStorage.setItem('portal_token', urlToken);
+    overlay.classList.add('hidden');
+    document.body.classList.remove('login-active');
+    logoutBtn.style.display = '';
+    boot();
+  } else if (saved) {
+    // Refresh path: re-use the durably persisted token (per-op or legacy).
     tokenInput.value = saved;
-    if (urlToken) {
-      token = urlToken;
-      overlay.classList.add('hidden');
-      document.body.classList.remove('login-active');
-      logoutBtn.style.display = '';
-      boot();
-    } else {
-      doAuth();
-    }
-  } else if (urlToken) {
     doAuth();
   }
 
@@ -3900,6 +3910,7 @@
     chatWs.onmessage = function(e) {
       try {
         var msg = JSON.parse(e.data);
+        if (msg.type === 'ping') return;  // Keepalive — ignore
         var placeholder = chatMessages.querySelector('.chat-loading');
         if (placeholder) placeholder.remove();
         // Skip WS echo of user messages already shown optimistically

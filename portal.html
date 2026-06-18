@@ -1628,18 +1628,21 @@
     location.reload();
   });
 
+  // Token-persistence fix (opfix 2026-06-18): a URL ?token= (per-operator token)
+  // is AUTHORITATIVE — persist it immediately so it survives a refresh. Previously
+  // a present urlToken was used in memory only when a saved token existed, so a
+  // refresh dropped the per-op token and fell back to the legacy token, losing
+  // operator attribution. On refresh (no urlToken) boot from the persisted token.
   var saved = localStorage.getItem('portal_token');
-  if (saved) {
+  if (urlToken) {
+    token = urlToken;
+    tokenInput.value = urlToken;
+    localStorage.setItem('portal_token', urlToken);
+    overlay.style.display = 'none';
+    logoutBtn.style.display = '';
+    boot();
+  } else if (saved) {
     tokenInput.value = saved;
-    if (urlToken) {
-      token = urlToken;
-      overlay.style.display = 'none';
-      logoutBtn.style.display = '';
-      boot();
-    } else {
-      doAuth();
-    }
-  } else if (urlToken) {
     doAuth();
   }
 
@@ -1879,6 +1882,7 @@
     chatWs.onmessage = function(e) {
       try {
         var msg = JSON.parse(e.data);
+        if (msg.type === 'ping') return;  // Keepalive — ignore
         var placeholder = chatMessages.querySelector('.chat-loading');
         if (placeholder) placeholder.remove();
         addMessage(msg.text, msg.role, msg.timestamp, msg.id);
