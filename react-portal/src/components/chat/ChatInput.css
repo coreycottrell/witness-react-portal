@@ -206,3 +206,15 @@
     padding: 8px 8px 12px;
   }
 }
+
+/* Voice input failure notice (surfaced from SpeechRecognition onerror) */
+.chat-voice-error {
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--text-secondary, #b8b8b8);
+  background: rgba(226, 193, 76, 0.08);
+  border: 1px solid rgba(226, 193, 76, 0.35);
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin: 0 0 8px 0;
+}
