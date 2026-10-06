@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "prebuild": "npm run test:mic",
     "build": "tsc -b && vite build",
+    "test:mic": "vitest run src/test/useSpeechRecognition.mobile.test.ts",
     "lint": "eslint .",
     "preview": "vite preview",
     "test": "vitest run",
