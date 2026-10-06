@@ -107,3 +107,53 @@ describe('NEGATIVE CONTROL: pre-fix hook reproduces the duplication Russell saw'
     expect(run(legacyUseSpeechRecognition as any, seqDesktop).final).toBe('hello there how are you')
   })
 })
+
+// ---------------------------------------------------------------------------------------------
+// REAL-DEVICE PATTERN (ticket 3499, 2026-10-06 13:37Z). This is Russell's actual message text as
+// stored in portal-chat.jsonl (id portal-1791293830176), split at each "okay" start. The old
+// hook produced that text by plain-concatenating a results list that held THESE 31 entries
+// (note several partials repeat 2-5 times, and the first 4 are bare "okay"). Fed to the fixed
+// hook, the same event must collapse to the single longest hypothesis.
+const RUSSELL_REAL = (
+  "okayokayokayokay" +
+  "okay I'mokay I'mokay I'm" +
+  "okay I'm testing" +
+  "okay I'm testing theokay I'm testing theokay I'm testing the" +
+  "okay I'm testing the microphoneokay I'm testing the microphoneokay I'm testing the microphone" +
+  "okay I'm testing the microphone and" +
+  "okay I'm testing the microphone and at" +
+  "okay I'm testing the microphone and at the sameokay I'm testing the microphone and at the same" +
+  "okay I'm testing the microphone and at the same timeokay I'm testing the microphone and at the same time" +
+  "okay I'm testing the microphone and at the same time telling" +
+  "okay I'm testing the microphone and at the same time telling youokay I'm testing the microphone and at the same time telling youokay I'm testing the microphone and at the same time telling you" +
+  "okay I'm testing the microphone and at the same time telling you I" +
+  "okay I'm testing the microphone and at the same time telling you I knewokay I'm testing the microphone and at the same time telling you I knewokay I'm testing the microphone and at the same time telling you I knewokay I'm testing the microphone and at the same time telling you I knewokay I'm testing the microphone and at the same time telling you I knew" +
+  "okay I'm testing the microphone and at the same time telling you I knew meta rule"
+)
+const REAL_ENTRIES = RUSSELL_REAL.split(/(?=okay)/).filter(Boolean)
+const REAL_FINAL = "okay I'm testing the microphone and at the same time telling you I knew meta rule"
+
+describe('REAL device pattern from ticket 3499 (partials repeat up to 5x)', () => {
+  it('sanity: 31 entries, concatenation reproduces the stored garbled message', () => {
+    expect(REAL_ENTRIES.length).toBe(31)
+    expect(REAL_ENTRIES.join('')).toBe(RUSSELL_REAL)
+  })
+  it('fixed hook: one event with all 31 interim entries -> one clean sentence', () => {
+    const ev = REAL_ENTRIES.map(t => ({ t, f: false }))
+    expect(run(useSpeechRecognition, [ev]).final).toBe(REAL_FINAL)
+  })
+  it('fixed hook: first 4 bare "okay" marked final, rest interim -> clean', () => {
+    const ev = REAL_ENTRIES.map((t, i) => ({ t, f: i < 4 }))
+    expect(run(useSpeechRecognition, [ev]).final).toBe(REAL_FINAL)
+  })
+  it('fixed hook: growing event stream (each event adds one entry) -> clean at every step', () => {
+    const evs = REAL_ENTRIES.map((_, i) => REAL_ENTRIES.slice(0, i + 1).map(t => ({ t, f: false })))
+    const { final, seen } = run(useSpeechRecognition, evs)
+    expect(final).toBe(REAL_FINAL)
+    seen.forEach(s => expect(REAL_FINAL.startsWith(s)).toBe(true))
+  })
+  it('NEGATIVE CONTROL: old hook reproduces Russell\'s exact garbled message byte-for-byte', () => {
+    const ev = REAL_ENTRIES.map(t => ({ t, f: false }))
+    expect(run(legacyUseSpeechRecognition as any, [ev]).final).toBe(RUSSELL_REAL)
+  })
+})
