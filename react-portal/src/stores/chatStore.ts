@@ -12,13 +12,13 @@ interface ChatState {
   wsConnected: boolean
   error: string | null
   loadHistory: () => Promise<void>
-  send: (text: string) => Promise<void>
+  send: (text: string, sender?: string) => Promise<void>
   react: (msgId: string, emoji: string, msgText: string, msgRole: 'user' | 'assistant') => Promise<void>
   connectWs: () => void
   disconnectWs: () => void
 }
 
-export const useChatStore = create<ChatState>((set) => ({
+export const useChatStore = create<ChatState>((set, get) => ({
   messages: [],
   loading: false,
   sending: false,
@@ -36,17 +36,31 @@ export const useChatStore = create<ChatState>((set) => ({
     }
   },
 
-  send: async (text: string) => {
+  send: async (text: string, sender?: string) => {
     set({ sending: true })
+    // Duplicate-message fix (2026-10-05): the server's /ws/chat broadcast can reach
+    // the browser BEFORE the POST response resolves. The old code then appended a
+    // local- echo on top of the already-delivered server row (two rows, one send).
+    // Snapshot the ids present before the POST; if a NEW non-local user row with the
+    // same text appeared while we awaited, that IS the server echo - skip the local row.
+    // (Id-snapshot, not timestamps: browser/server clocks may disagree.)
+    const idsBefore = new Set(get().messages.map(m => m.id))
     try {
-      await sendChatMessage(text)
+      await sendChatMessage(text, sender)
       const userMsg: ChatMessage = {
         id: `local-${Date.now()}`,
         text,
         role: 'user',
         timestamp: Date.now() / 1000,
+        sender,
       }
-      set(s => ({ messages: [...s.messages, userMsg], sending: false }))
+      set(s => {
+        const echoed = s.messages.some(
+          m => !idsBefore.has(m.id) && !m.id.startsWith('local-') &&
+               m.role === 'user' && (m.text || '').trim() === text.trim()
+        )
+        return echoed ? { sending: false } : { messages: [...s.messages, userMsg], sending: false }
+      })
     } catch (e) {
       console.error('[chat] send failed:', e)
       set({ sending: false })

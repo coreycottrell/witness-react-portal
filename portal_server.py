@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
-"""PureBrain Portal Server — per-CIV mini server for purebrain.ai
-Auth via Bearer token. JSONL-based chat history (same as TG bot).
+"""
+╔══════════════════════════════════════════════════════════════════════╗
+║  WITNESS-ONLY PORTAL SERVER — BESPOKE ONE-OFF                      ║
+║                                                                      ║
+║  THIS IS NOT THE PUREBRAIN PORTAL. NO OTHER CIV HAS OR SHOULD      ║
+║  HAVE THIS CODE. DO NOT DEPLOY TO FLEET CONTAINERS. EVER.           ║
+║                                                                      ║
+║  The PureBrain portal that born CIVs use lives in GitHub:            ║
+║    github.com/coreycottrell/purebrain-onboarding/portal/             ║
+║                                                                      ║
+║  This file has Witness-specific features (fleet panel, points,       ║
+║  margins, BOOP capture) that do not belong in fleet CIV portals.    ║
+║                                                                      ║
+║  Corey directive 2026-03-30: "the SECOND you start comparing to     ║
+║  YOUR portal code which is a bespoke one off" — never again.         ║
+╚══════════════════════════════════════════════════════════════════════╝
 """
 import asyncio
 import hashlib
@@ -9,6 +23,7 @@ import os
 import re
 import secrets
 import subprocess
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,9 +76,73 @@ except Exception:
     HUMAN_NAME = "User"
 # Auto-derive Claude project JSONL directory from the home path.
 # Claude encodes paths by replacing '/' with '-', so /home/aiciv → -home-aiciv.
-# This works for any user in any container without manual patching.
+# Claude Code appends the CWD to the encoding (e.g. -home-aiciv-civ when run from ~/civ),
+# so we scan ALL matching project directories and pick the one with the most recent JSONL.
 _encoded_home = str(Path.home()).replace("/", "-")
-LOG_ROOT = Path.home() / ".claude" / "projects" / _encoded_home
+_projects_dir = Path.home() / ".claude" / "projects"
+
+# ── CHAT-BLIND FIX (2026-06-26) ──────────────────────────────────────
+# LOG_ROOT was previously computed ONCE at module import and never
+# re-resolved.  After enough uptime across /clear cycles the "winner"
+# project directory drifted from the LIVE session's directory
+# (e.g. -home-aiciv vs -home-aiciv-civ), making assistant replies
+# invisible while portal-chat.jsonl (separate file) kept working.
+#
+# Fix: _resolve_log_root() re-scans every call but caches for 10 s so
+# hot-path polling (ws_chat 0.8 s, thinking-monitor 0.8 s) does not
+# stat-storm the filesystem.  The 10 s TTL means a /clear that moves
+# the live session self-heals within 10 s — no portal restart needed.
+# ──────────────────────────────────────────────────────────────────────
+_log_root_cache: dict = {}  # {"root": Path, "expires": float}
+_LOG_ROOT_TTL = 10.0  # seconds
+
+
+def _resolve_log_root() -> Path:
+    """Return the project directory containing the most-recently-modified JSONL.
+
+    Re-scans candidate directories but caches the result for _LOG_ROOT_TTL
+    seconds to avoid excessive stat calls on the hot polling paths.
+    """
+    now = time.time()
+    cached = _log_root_cache.get("root")
+    expires = _log_root_cache.get("expires", 0)
+    if cached and now < expires:
+        return cached
+
+    # PIN-SESSION FIX (2026-09-23): ONLY Primary's own project dir (-home-aiciv).
+    # Previously any dir starting with -home-aiciv (e.g. headless `claude -p` test
+    # runs under -home-aiciv-civ-state-...) could win on mtime, and their prompts
+    # were rendered in portal chat as untagged user messages.
+    result = _projects_dir / _encoded_home
+    _log_root_cache.update(root=result, expires=now + _LOG_ROOT_TTL)
+    return result
+
+
+# Legacy alias — kept so the handful of one-shot reads (HISTORY_FILE etc.)
+# that never depended on LOG_ROOT keep working.  All JSONL-resolution paths
+# now call _resolve_log_root() instead.
+LOG_ROOT = _resolve_log_root()
+
+
+PRIMARY_SESSION_ID_FILE = Path.home() / ".primary-session-id"
+
+
+def _sorted_session_logs(log_root: Path) -> list:
+    """Session JSONLs in log_root, newest-first, with Primary's session PINNED first.
+
+    Primary's session id comes from ~/.primary-session-id; mtime ordering is only
+    the fallback within this one dir (glob is non-recursive, so subagents/ never match).
+    """
+    logs = sorted(log_root.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    try:
+        sid = PRIMARY_SESSION_ID_FILE.read_text().strip()
+        if sid:
+            pinned = log_root / f"{sid}.jsonl"
+            if pinned.is_file():
+                logs = [pinned] + [l for l in logs if l != pinned]
+    except Exception:
+        pass
+    return logs
 HISTORY_FILE = Path.home() / ".claude" / "history.jsonl"
 PORTAL_CHAT_LOG = SCRIPT_DIR / "portal-chat.jsonl"
 UPLOADS_DIR = Path.home() / "portal_uploads"
@@ -101,6 +180,54 @@ else:
     TOKEN_FILE.chmod(0o600)
     print(f"[portal] Generated new bearer token: {BEARER_TOKEN}")
 
+# ---------------------------------------------------------------------------
+# Per-operator sender attribution (Gen-34 "portal stamps authenticated sender")
+# ---------------------------------------------------------------------------
+# Maps a per-operator token -> operator display NAME. When an authenticated
+# operator sends a message through the portal, the injected tmux text is
+# prefixed with "[<Name>] " so Primary knows WHO is speaking.
+#
+# Backward compatible: the legacy single BEARER_TOKEN still authenticates and
+# maps to the default "operator" name, so nothing breaks if this file is
+# absent or a legacy client connects.
+#
+# To add a future operator: add a "token": "Name" entry to .portal-operators.json
+# (generate a token with `python3 -c "import secrets;print(secrets.token_urlsafe(32))"`),
+# chmod 600 the file, and restart the portal. The token authenticates exactly
+# like the legacy token and its messages get tagged "[Name]".
+OPERATORS_FILE = SCRIPT_DIR / ".portal-operators.json"
+DEFAULT_OPERATOR_NAME = "operator"
+OPERATOR_TOKENS: dict = {}
+if OPERATORS_FILE.exists():
+    try:
+        _ops_raw = json.loads(OPERATORS_FILE.read_text())
+        if isinstance(_ops_raw, dict):
+            # token -> name; strip to be safe
+            OPERATOR_TOKENS = {str(k).strip(): str(v).strip()
+                               for k, v in _ops_raw.items() if str(k).strip()}
+        print(f"[portal] Loaded {len(OPERATOR_TOKENS)} operator identities: "
+              f"{sorted(set(OPERATOR_TOKENS.values()))}")
+    except Exception as _e:
+        print(f"[portal] WARN: failed to load {OPERATORS_FILE}: {_e} — "
+              f"falling back to single-token mode")
+        OPERATOR_TOKENS = {}
+
+
+def resolve_operator(request) -> str:
+    """Return the operator display name for an authenticated request.
+
+    Checks the Bearer header first, then the ?token= query param. Per-operator
+    tokens (.portal-operators.json) win; the legacy BEARER_TOKEN maps to
+    DEFAULT_OPERATOR_NAME. Returns DEFAULT_OPERATOR_NAME for any authenticated
+    request whose token isn't a known per-operator token (backward compatible).
+    Callers should only use this AFTER check_auth() has passed.
+    """
+    auth = request.headers.get("authorization", "")
+    tok = auth[7:] if auth.startswith("Bearer ") else request.query_params.get("token", "")
+    if tok and tok in OPERATOR_TOKENS:
+        return OPERATOR_TOKENS[tok]
+    return DEFAULT_OPERATOR_NAME
+
 
 def get_tmux_session() -> str:
     """Find the live primary Claude Code session for this container."""
@@ -111,7 +238,15 @@ def get_tmux_session() -> str:
         except subprocess.CalledProcessError:
             return False
 
-    # FIRST: Find the currently attached session — mirrors telegram_bridge logic.
+    # FIRST: Check .current_session marker — most reliable, set at session start.
+    # This avoids grabbing team lead panes that happen to be "attached".
+    marker = Path.home() / ".current_session"
+    if marker.exists():
+        name = marker.read_text().strip()
+        if name and alive(name):
+            return name
+
+    # FALLBACK: Find the currently attached session.
     # Claude Code sessions are numbered (e.g. "28"), not named "{civ}-primary",
     # so the name-based scan below misses them. The attached session IS the active one.
     try:
@@ -126,12 +261,6 @@ def get_tmux_session() -> str:
                     return attached
     except Exception:
         pass
-
-    marker = Path.home() / ".current_session"
-    if marker.exists():
-        name = marker.read_text().strip()
-        if name and alive(name):
-            return name
     try:
         out = subprocess.check_output(["tmux", "list-sessions", "-F", "#{session_name}"],
                                       stderr=subprocess.DEVNULL, text=True)
@@ -176,7 +305,8 @@ def _find_current_session_id():
 def _get_all_session_log_paths(max_files=10):
     """Get paths to recent JSONL session logs, ordered oldest-first."""
     try:
-        logs = sorted(LOG_ROOT.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+        log_root = _resolve_log_root()
+        logs = _sorted_session_logs(log_root)
         return list(reversed(logs[:max_files]))
     except Exception:
         return []
@@ -453,12 +583,16 @@ def _parse_jsonl_messages_from_file(log_path):
                 else:
                     ts = time.time()
 
-                messages.append({
+                msg_entry = {
                     "role": role,
                     "text": combined,
                     "timestamp": int(ts),
                     "id": entry.get("uuid", f"msg-{log_path.stem[:8]}-{len(messages)}")
-                })
+                }
+                # Tag BOOP prompts so frontend can render them distinctly
+                if role == "user" and "THIS IS YOUR SACRED DUTY" in combined[:100]:
+                    msg_entry["source"] = "boop"
+                messages.append(msg_entry)
     except Exception:
         pass
 
@@ -493,14 +627,23 @@ def _load_portal_messages():
     return messages
 
 
-def _save_portal_message(text, role="user"):
-    """Save a message sent via the portal."""
+def _save_portal_message(text, role="user", source=None, sender=None):
+    """Save a message sent via the portal.
+
+    P20 (operator identity): `sender` is the self-selected operator name
+    (Corey / Russell / other). Persisting it lets every operator's page — and
+    a plain refresh — render WHO said each line instead of a hardcoded name.
+    """
     entry = {
         "role": role,
         "text": text,
         "timestamp": int(time.time()),
         "id": f"portal-{int(time.time() * 1000)}",
     }
+    if source:
+        entry["source"] = source
+    if sender:
+        entry["sender"] = sender
     try:
         with PORTAL_CHAT_LOG.open("a") as f:
             f.write(json.dumps(entry) + "\n")
@@ -510,8 +653,52 @@ def _save_portal_message(text, role="user"):
     return entry
 
 
+# CPU-spin fix (2026-07-09): _parse_all_messages fully re-read+re-parsed the 10
+# newest session JSONLs (~20MB) PLUS the entire portal-chat.jsonl (grew to ~53MB)
+# on EVERY call. ws_chat calls this every 0.8s PER connected client; with 5 live
+# ws_chat clients that is ~0.47s x 5 / 0.8s = ~291% demanded CPU on the single
+# asyncio event loop -> one core pinned at ~95% AND the loop permanently backlogged,
+# so every HTTP request starved ~4s and "/" timed out. Same class as the P3
+# /api/context fix. Fix: a short TTL cache shared across all callers/clients so N
+# concurrent ws_chat clients trigger ONE parse per _PARSE_ALL_TTL, not N per 0.8s.
+# Cache invalidates immediately when the portal-chat log or newest session file
+# changes (mtime+size), so freshness is preserved. Backup: portal_server.py.bak.parsecache.*
+_PARSE_ALL_TTL = 1.0            # seconds; rapid multi-client polls reuse one parse
+_parse_all_cache: dict = {}    # last_n -> (expires_at, signature, result_list)
+
+
+def _parse_all_signature():
+    """Cheap change-signature: (mtime,size) of portal-chat log + newest session file.
+    Stat-only — no reads. Any new message bumps one of these, invalidating the cache."""
+    parts = []
+    try:
+        st = PORTAL_CHAT_LOG.stat()
+        parts.append((st.st_mtime, st.st_size))
+    except Exception:
+        parts.append((0, 0))
+    try:
+        paths = _get_all_session_log_paths(max_files=1)
+        if paths:
+            st = Path(paths[0]).stat()
+            parts.append((st.st_mtime, st.st_size))
+    except Exception:
+        parts.append((0, 0))
+    return tuple(parts)
+
+
 def _parse_all_messages(last_n=100):
-    """Parse messages across all recent session logs + portal log."""
+    """Parse messages across all recent session logs + portal log.
+
+    TTL-cached (see note above): reuses a recent parse across rapid/concurrent
+    callers so ws_chat's many clients don't each re-parse tens of MB every cycle."""
+    now = time.time()
+    sig = _parse_all_signature()
+    cached = _parse_all_cache.get(last_n)
+    if cached:
+        c_expires, c_sig, c_result = cached
+        if c_sig == sig and now < c_expires:
+            return c_result
+
     all_messages = []
 
     # JSONL session logs
@@ -530,14 +717,19 @@ def _parse_all_messages(last_n=100):
         seen_idx[m["id"]] = i
     deduped = [all_messages[i] for i in sorted(seen_idx.values())]
 
-    return deduped[-last_n:] if len(deduped) > last_n else deduped
+    result = deduped[-last_n:] if len(deduped) > last_n else deduped
+    _parse_all_cache[last_n] = (now + _PARSE_ALL_TTL, sig, result)
+    return result
 
 
 def check_auth(request: Request) -> bool:
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer "):
-        return auth[7:] == BEARER_TOKEN
-    return request.query_params.get("token") == BEARER_TOKEN
+        tok = auth[7:]
+    else:
+        tok = request.query_params.get("token", "")
+    # Legacy single token OR any per-operator token authenticates.
+    return tok == BEARER_TOKEN or tok in OPERATOR_TOKENS
 
 
 # ---------------------------------------------------------------------------
@@ -658,6 +850,498 @@ async def api_chat_history(request: Request) -> JSONResponse:
     return JSONResponse({"messages": messages, "count": len(messages), "timestamp": int(time.time())})
 
 
+# ---------------------------------------------------------------------------
+# DURABLE portal->tmux delivery (task#36 fix, 2026-09-17).
+#
+# ROOT CAUSE of the recurring "orphan-unsent" stall: api_chat_send persisted the
+# message then FIRE-AND-FORGET send-keys with only a fixed 5x0.5s (2.5s) Enter
+# retry and NO confirmation. When Primary was busy (mid-gen / "Waiting for N
+# workflows" / a TUI modal) the Enter was swallowed, the 2.5s window expired, and
+# the text sat UNSENT in the composer forever. No queue, no readback, no replay ->
+# stored-but-not-injected messages were lost. (13th occurrence when fixed.)
+#
+# FIX: (1) CONFIRM-BY-READBACK + NUDGE — after send, poll the tmux composer; while
+# our text is still sitting there, press Enter again, bounded to ~120s (covers a
+# long Primary-busy stretch). (2) PENDING QUEUE — every send is queued undelivered
+# and only cleared once the composer no longer holds our text. (3) REPLAY on
+# startup — re-inject anything still queued (closes the outage black-hole).
+# (4) Dead/unreachable pane -> honest queued/delivered:false, never a false "sent"
+# and never send-keys to a dead target. Backup: portal_server.py.bak-msgdrop-*
+# ---------------------------------------------------------------------------
+PENDING_DELIVERY_LOG = SCRIPT_DIR / "portal-pending-deliveries.jsonl"
+_DELIVERY_DEADLINE_SECS = 120  # max window to keep nudging a busy Primary
+_BORDER_CHARS = set("─—-═_")   # chars that make up the TUI composer box borders
+
+
+def _dnorm(s):
+    """Whitespace-normalized, case-folded — for robust needle matching."""
+    return re.sub(r"\s+", " ", s or "").strip().casefold()
+
+
+def _send_text(target, tagged):
+    """Type + submit a tagged message into a tmux pane. Returns True on success.
+
+    LARGE-MESSAGE FIX (task#36, 2026-09-21): the previous implementation used
+    `tmux send-keys -t <pane> -l "\\n<tagged>"`. tmux HARD-REJECTS any send-keys
+    command line >= 16 KiB (2^14) with "command too long" (exit 1) — the ENTIRE
+    payload is dropped (a total reject, never a truncation), so every operator
+    message over ~16 KB was saved to portal history but NEVER injected into
+    Primary's pane, then re-queued forever (the "only big messages" drop).
+
+    `tmux load-buffer` (from a temp file) + `paste-buffer` streams the payload
+    into the pane with NO length limit, so arbitrarily large messages deliver
+    intact. Downstream behaviour is preserved: the leading literal newline
+    clears any partial composer input, and a separate Enter keypress submits —
+    so the existing composer-readback / needle confirm loop is unchanged."""
+    tmp_path = None
+    buf = f"portalmsg-{os.getpid()}-{int(time.time() * 1000000)}"
+    try:
+        payload = f"\n{tagged}"
+        fd, tmp_path = tempfile.mkstemp(prefix="portalmsg-", suffix=".txt")
+        with os.fdopen(fd, "w") as f:
+            f.write(payload)
+        # Named, unique-per-send buffer so concurrent injections never clobber
+        # each other; -d deletes the buffer after a successful paste (cleanup).
+        subprocess.run(["tmux", "load-buffer", "-b", buf, tmp_path],
+                       check=True, stderr=subprocess.DEVNULL)
+        subprocess.run(["tmux", "paste-buffer", "-d", "-b", buf, "-t", target],
+                       check=True, stderr=subprocess.DEVNULL)
+        subprocess.run(["tmux", "send-keys", "-t", target, "Enter"],
+                       check=True, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        # If paste never ran, the named buffer may still exist — best-effort drop.
+        try:
+            subprocess.run(["tmux", "delete-buffer", "-b", buf],
+                           check=False, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+        return False
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+
+def _tmux_enter(target):
+    """Best-effort single Enter (nudge a swallowed submit)."""
+    try:
+        subprocess.run(["tmux", "send-keys", "-t", target, "Enter"],
+                       check=False, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def _read_composer_text(target):
+    """Return the normalized text currently sitting in the TUI composer input box,
+    or None if the layout can't be parsed. Empty string => composer is empty
+    (message was submitted). The composer is the region between the last two
+    horizontal border lines near the bottom of the pane."""
+    try:
+        out = subprocess.check_output(
+            ["tmux", "capture-pane", "-t", target, "-p"],
+            stderr=subprocess.DEVNULL, text=True)
+    except Exception:
+        return None
+    lines = out.splitlines()
+    borders = [i for i, l in enumerate(lines)
+               if len(l.strip()) >= 20 and set(l.strip()) <= _BORDER_CHARS]
+    if len(borders) < 2:
+        return None
+    top, bot = borders[-2], borders[-1]
+    content = " ".join(lines[top + 1:bot]).strip()
+    content = re.sub(r"^[❯>›»\s]+", "", content)  # drop leading prompt marker(s)
+    return _dnorm(content)
+
+
+# ---------------------------------------------------------------------------
+# BY-EFFECT DELIVERY CONFIRMATION (ticket 3389, 2026-09-30).
+#
+# ROOT CAUSE of the 2026-09-30 14:06:33Z silent drop (portal-1790777193564):
+# the confirm loop above treated "our text is no longer in the composer" as
+# DELIVERED. That is a proxy. If the keystrokes land anywhere other than the
+# composer (a TUI overlay / footer panel / modal, a layout the parser cannot
+# see), the composer never holds the text, so the loop cleared the queue row
+# and the message vanished: HTTP 200, no pending row, no submit in Claude Code.
+#
+# FIX: DELIVERED now means Claude Code ITSELF recorded the submit — a `user`
+# turn or a `queue-operation` (typed-while-busy) entry in Primary's session
+# transcript, or a ~/.claude/history.jsonl prompt row — carrying our operator
+# tag AND our needle, timestamped at/after the first send. Until then the row
+# stays queued. An unconfirmed message is re-sent ONLY when Primary's turn has
+# ENDED (so we never type blind into a busy/modal pane and never send Escape
+# mid-turn, which would interrupt Primary), after a single Escape to dismiss
+# any overlay. Resends are bounded per row (_MAX_TOTAL_RESENDS) so a detection
+# fault can never become a duplicate storm. Every step is journaled to
+# portal-delivery-journal.jsonl (the delivery path had NO log lines before).
+# If Primary's transcript cannot be located at all, the old composer heuristic
+# is used as a fallback (journaled), never a silent guess.
+# Backup: portal_server.py.bak-pre-deliveryconfirm-*
+# ---------------------------------------------------------------------------
+DELIVERY_JOURNAL = SCRIPT_DIR / "portal-delivery-journal.jsonl"
+_RESEND_GRACE_SECS = 10      # unconfirmed + not in composer this long after a send -> resend
+_MAX_TOTAL_RESENDS = 6       # hard cap per message across all windows (no duplicate storms)
+_NON_TURN_TYPES = {"queue-operation", "attachment", "file-history-snapshot",
+                   "last-prompt", "ai-title", "mode", "permission-mode",
+                   "atis-latch", "frame-link", "summary", "custom-title"}
+
+
+def _djournal(event, msg_id, **kw):
+    """Append one timestamped delivery event (the delivery path's own log)."""
+    try:
+        rec = {"t": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+               "event": event, "id": msg_id}
+        rec.update(kw)
+        with DELIVERY_JOURNAL.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
+def _tail_lines(path, nbytes):
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - nbytes))
+        data = f.read()
+    lines = data.split(b"\n")
+    if size > nbytes and lines:
+        lines = lines[1:]            # first line is probably partial
+    return lines
+
+
+def _iso_epoch(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+
+
+def _entry_submit_text(d):
+    """Text of a transcript entry that represents operator INPUT, else None."""
+    t = d.get("type")
+    if t == "queue-operation":
+        c = d.get("content")
+    elif t == "user":
+        c = (d.get("message") or {}).get("content")
+    else:
+        return None
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(x.get("text", "") for x in c
+                        if isinstance(x, dict) and x.get("type") == "text")
+    return None
+
+
+def _primary_log_paths():
+    try:
+        return _sorted_session_logs(_resolve_log_root())[:2]
+    except Exception:
+        return []
+
+
+def _submit_recorded(tag_norm, needle, since):
+    """By-effect proof that Claude Code accepted the message. Returns a short
+    'where' string, or None if not (yet) recorded."""
+    if not needle:
+        return None
+
+    def _match(txt):
+        n = _dnorm(txt)
+        return needle in n and (not tag_norm or tag_norm in n)
+
+    for p in _primary_log_paths():
+        try:
+            if p.stat().st_mtime < since - 5:
+                continue
+            for raw in reversed(_tail_lines(p, 4_000_000)):
+                if not raw.strip():
+                    continue
+                try:
+                    d = json.loads(raw)
+                except Exception:
+                    continue
+                ts = d.get("timestamp")
+                if not ts:
+                    continue
+                try:
+                    e = _iso_epoch(ts)
+                except Exception:
+                    continue
+                if e < since - 120:  # entries are ~ordered; generous margin
+                    break
+                if e < since:
+                    continue
+                txt = _entry_submit_text(d)
+                if txt and _match(txt):
+                    return f"transcript:{p.stem[:8]}:{d.get('type')}:{ts}"
+        except Exception:
+            continue
+    try:
+        for raw in reversed(_tail_lines(HISTORY_FILE, 262144)):
+            if not raw.strip():
+                continue
+            try:
+                d = json.loads(raw)
+            except Exception:
+                continue
+            e = (d.get("timestamp") or 0) / 1000.0
+            if e < since - 120:
+                break
+            if e < since:
+                continue
+            blob = d.get("display") or ""
+            pc = d.get("pastedContents") or {}
+            if isinstance(pc, dict):
+                for v in pc.values():
+                    if isinstance(v, dict):
+                        blob += " " + str(v.get("content", ""))
+            if _match(blob):
+                return f"history:{int(e)}"
+    except Exception:
+        pass
+    return None
+
+
+def _primary_turn_ended():
+    """True only if Primary's latest turn has ENDED (last significant transcript
+    entry is system/turn_duration). Unknown -> False, so we never send Escape or
+    re-type into a pane that may be mid-turn or showing a permission modal."""
+    logs = _primary_log_paths()
+    if not logs:
+        return False
+    try:
+        for raw in reversed(_tail_lines(logs[0], 400_000)):
+            if not raw.strip():
+                continue
+            try:
+                d = json.loads(raw)
+            except Exception:
+                continue
+            t = d.get("type")
+            if not t or t in _NON_TURN_TYPES:
+                continue
+            return t == "system" and d.get("subtype") == "turn_duration"
+    except Exception:
+        pass
+    return False
+
+
+def _tmux_escape(target):
+    try:
+        subprocess.run(["tmux", "send-keys", "-t", target, "Escape"],
+                       check=False, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def _tag_of(tagged):
+    """'[Russell] [portal] msg' -> normalized '[russell] [portal]'."""
+    m = re.match(r"^\s*(\[[^\]]*\]\s*\[[^\]]*\])", tagged or "")
+    return _dnorm(m.group(1)) if m else ""
+
+
+def _queue_pending(msg_id, tagged, needle):
+    now = int(time.time())
+    try:
+        with PENDING_DELIVERY_LOG.open("a") as f:
+            f.write(json.dumps({"id": msg_id, "tagged": tagged, "needle": needle,
+                                "ts": now, "first_ts": now, "resends": 0}) + "\n")
+    except Exception:
+        pass
+    _djournal("queued", msg_id, needle=needle)
+
+
+def _load_pending():
+    rows = []
+    if not PENDING_DELIVERY_LOG.exists():
+        return rows
+    try:
+        with PENDING_DELIVERY_LOG.open("r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return rows
+
+
+def _write_pending(rows):
+    try:
+        tmp = str(PENDING_DELIVERY_LOG) + ".tmp"
+        with open(tmp, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        os.replace(tmp, str(PENDING_DELIVERY_LOG))
+    except Exception:
+        pass
+
+
+def _update_pending(msg_id, **fields):
+    rows = _load_pending()
+    hit = False
+    for r in rows:
+        if r.get("id") == msg_id:
+            r.update(fields)
+            hit = True
+    if hit:
+        _write_pending(rows)
+
+
+def _get_pending(msg_id):
+    for r in _load_pending():
+        if r.get("id") == msg_id:
+            return r
+    return None
+
+
+def _mark_delivered(msg_id):
+    """Remove a confirmed-delivered row from the pending queue. Runs on the single
+    asyncio event loop, so no locking is needed (cooperative scheduling)."""
+    rows = _load_pending()
+    remaining = [r for r in rows if r.get("id") != msg_id]
+    if len(remaining) == len(rows):
+        return
+    _write_pending(remaining)
+
+
+async def _deliver_and_confirm(tagged, needle, msg_id, initial_send,
+                               deadline=_DELIVERY_DEADLINE_SECS):
+    """Deliver a message and CONFIRM BY EFFECT that Claude Code recorded it.
+
+      - Claude Code recorded the submit (transcript user/queue entry or prompt
+        history, with our tag + needle, after first send) -> DELIVERED.
+      - text still sitting in the composer -> press Enter (swallowed submit).
+      - not recorded, not in composer, >= grace since our last send, Primary's
+        turn has ENDED -> single Escape (dismiss overlay), re-check composer,
+        then re-send. Busy/unknown -> wait (never type blind, never Escape
+        mid-turn). Bounded by _MAX_TOTAL_RESENDS per message.
+      - deadline -> stays QUEUED; the periodic sweep resumes it.
+    Re-resolves the live Primary pane each iteration (pane ids change)."""
+    row = _get_pending(msg_id) or {}
+    since = float(row.get("first_ts") or row.get("ts") or time.time()) - 1
+    resends = int(row.get("resends") or 0)
+    tag_norm = _tag_of(tagged)
+    fallback = not _primary_log_paths()
+    if fallback:
+        _djournal("fallback_legacy_no_transcript", msg_id)
+    start = time.time()
+    ever_sent = not initial_send   # handler path already sent inline
+    last_send = start if ever_sent else 0.0
+    saw_stuck = False
+    nudges = 0
+    await asyncio.sleep(1.2)        # let the TUI render / settle
+    while time.time() - start < deadline:
+        if not fallback:
+            where = _submit_recorded(tag_norm, needle, since)
+            if where:
+                _mark_delivered(msg_id)
+                _djournal("delivered", msg_id, proof=where, resends=resends,
+                          nudges=nudges, secs=round(time.time() - start, 1))
+                return True
+        target = _find_primary_pane()
+        is_pane = isinstance(target, str) and target.startswith("%")
+        if not is_pane:
+            await asyncio.sleep(2)
+            continue
+        comp = _read_composer_text(target)
+        if comp and needle and needle in comp:
+            if not saw_stuck:
+                _djournal("stuck_in_composer", msg_id, pane=target)
+            saw_stuck = True
+            nudges += 1
+            _tmux_enter(target)      # swallowed submit -> nudge
+            await asyncio.sleep(2)
+            continue
+        if fallback:
+            if ever_sent and comp is not None:
+                _mark_delivered(msg_id)          # legacy proxy (no transcript)
+                _djournal("delivered_legacy_proxy", msg_id)
+                return True
+            if not ever_sent and _send_text(target, tagged):
+                ever_sent, last_send = True, time.time()
+            await asyncio.sleep(2)
+            continue
+        if ever_sent and time.time() - last_send < _RESEND_GRACE_SECS:
+            await asyncio.sleep(2)
+            continue
+        # Unconfirmed and not in the composer: (re)send, but only safely.
+        fresh = (time.time() - since) < 30
+        idle = _primary_turn_ended()
+        if not idle and (ever_sent or not fresh):
+            await asyncio.sleep(2)   # busy/unknown: never type blind into it
+            continue
+        if ever_sent or not fresh:
+            if resends >= _MAX_TOTAL_RESENDS:
+                _djournal("resend_cap_reached_needs_attention", msg_id,
+                          resends=resends)
+                return False
+            if idle:
+                _tmux_escape(target)            # dismiss any overlay/panel
+                await asyncio.sleep(0.6)
+                comp = _read_composer_text(target)
+                if comp and needle and needle in comp:
+                    _tmux_enter(target)
+                    await asyncio.sleep(2)
+                    continue
+        if _send_text(target, tagged):
+            if ever_sent or not fresh:
+                resends += 1
+                _update_pending(msg_id, resends=resends)
+            _djournal("resent" if ever_sent else "sent", msg_id, pane=target,
+                      idle=idle, resends=resends)
+            ever_sent, last_send = True, time.time()
+        else:
+            _djournal("send_failed", msg_id, pane=target)
+        await asyncio.sleep(1.5)
+    _djournal("unconfirmed_at_deadline_kept_queued", msg_id,
+              ever_sent=ever_sent, saw_stuck=saw_stuck, resends=resends)
+    return False                     # stays queued for the sweep
+
+
+async def _replay_pending_deliveries():
+    """On (re)start, redeliver anything still queued in order — so a portal or
+    session restart can't black-hole operator messages. (Already-recorded rows
+    are confirmed from the transcript first, never re-typed.)"""
+    await asyncio.sleep(8)           # let tmux / the session settle first
+    for r in sorted(_load_pending(), key=lambda x: x.get("ts", 0)):
+        try:
+            _djournal("replay", r.get("id", ""))
+            await _deliver_and_confirm(r.get("tagged", ""), r.get("needle", ""),
+                                       r.get("id", ""), initial_send=True)
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+
+
+async def _periodic_delivery_sweep():
+    """Drain the pending queue WITHOUT needing a restart. Every 90s, resume any
+    row whose previous confirm loop has certainly ended (age > deadline+buffer),
+    so there is no overlap with an in-flight loop -> no double-injection.
+    `ts` is bumped per window; `first_ts` (the confirm baseline) never moves."""
+    while True:
+        await asyncio.sleep(90)
+        try:
+            now = int(time.time())
+            stale = [r for r in _load_pending()
+                     if now - r.get("ts", now) > _DELIVERY_DEADLINE_SECS + 30]
+            for r in sorted(stale, key=lambda x: x.get("ts", 0)):
+                _djournal("sweep_retry", r.get("id", ""))
+                ok = await _deliver_and_confirm(r.get("tagged", ""), r.get("needle", ""),
+                                                r.get("id", ""), initial_send=True)
+                if not ok:
+                    _update_pending(r.get("id"), ts=int(time.time()),
+                                    first_ts=r.get("first_ts") or r.get("ts"))
+                await asyncio.sleep(1)
+        except Exception:
+            pass
+
+
 async def api_chat_send(request: Request) -> JSONResponse:
     """Inject a message into the tmux session. Response comes via /api/chat/stream or history."""
     if not check_auth(request):
@@ -665,40 +1349,78 @@ async def api_chat_send(request: Request) -> JSONResponse:
     try:
         body = await request.json()
         message = str(body.get("message", "")).strip()
+        # P20 operator identity: the page self-declares WHO is speaking
+        # (Corey / Russell / other). Sanitize to a short, safe display token.
+        _sender_raw = str(body.get("sender", "")).strip()
+        sender_sel = re.sub(r"[^\w .\-]", "", _sender_raw)[:40].strip()
     except Exception:
         return JSONResponse({"error": "invalid json"}, status_code=400)
 
     if not message:
         return JSONResponse({"error": "empty message"}, status_code=400)
 
-    # Save to portal chat log for history
-    _save_portal_message(message, role="user")
+    # PROBE LOGGING — catch ANY message containing "PROBE" for investigation
+    if "PROBE" in message.upper():
+        import datetime as _dt, logging as _logging, json as _json
+        _client = request.client.host if request.client else "unknown"
+        _headers = dict(request.headers)
+        _log_entry = {
+            "timestamp": _dt.datetime.utcnow().isoformat() + "Z",
+            "endpoint": "chat_send",
+            "client_ip": _client,
+            "message": message[:500],
+            "headers": _headers,
+        }
+        with open("/tmp/probe-trace.log", "a") as _f:
+            _f.write(_json.dumps(_log_entry) + "\n")
+        _logging.getLogger("uvicorn.error").warning("PROBE via chat_send: client=%s msg=%s headers=%s", _client, message[:120], _json.dumps(_headers))
+
+    # Sender attribution: prepend the operator's name so Primary knows WHO is
+    # speaking (e.g. "[Russell] [portal] <msg>"). P20: an explicit page-selected
+    # operator WINS over the token-derived name (the token can be shared/stale —
+    # that was the source of the blind, conflicting two-operator signals). Falls
+    # back to the token-derived name, then "operator" — fully backward compatible.
+    operator = sender_sel or resolve_operator(request)
+
+    # Save to portal chat log for history (with sender so every operator's page
+    # and a plain refresh render WHO said each line — P20 live attribution).
+    _saved = _save_portal_message(message, role="user", sender=operator)
+    msg_id = _saved.get("id", f"portal-{int(time.time() * 1000)}")
 
     # Tag injection source so tmux pane shows where input came from
     host = request.headers.get("referer", "")
     if "react" in host:
-        tagged = f"[portal-react] {message}"
+        source_tag = "[portal-react]"
     else:
-        tagged = f"[portal] {message}"
+        source_tag = "[portal]"
+    tagged = f"[{operator}] {source_tag} {message}"
 
-    session = get_tmux_session()
-    try:
-        # Leading newline clears any partial input in buffer
-        subprocess.run(["tmux", "send-keys", "-t", session, "-l", f"\n{tagged}"],
-                       check=True, stderr=subprocess.DEVNULL)
-        subprocess.run(["tmux", "send-keys", "-t", session, "Enter"],
-                       check=True, stderr=subprocess.DEVNULL)
-        # 5x Enter retries (matches Telegram bridge pattern) — ensures Claude
-        # processes the message even if busy with tool calls or generation
-        async def _retry_enters():
-            for _ in range(5):
-                await asyncio.sleep(0.5)
-                subprocess.run(["tmux", "send-keys", "-t", session, "Enter"],
-                               check=False, stderr=subprocess.DEVNULL)
-        asyncio.ensure_future(_retry_enters())
-        return JSONResponse({"status": "sent", "timestamp": int(time.time())})
-    except subprocess.CalledProcessError as e:
-        return JSONResponse({"error": f"tmux error: {e}"}, status_code=500)
+    # DURABLE delivery (task#36): queue first, then deliver-and-CONFIRM. A distinctive
+    # tail of the operator's message is the "needle" we look for in the composer.
+    needle = _dnorm(message)
+    needle = needle[-24:] if len(needle) > 24 else needle
+    _queue_pending(msg_id, tagged, needle)
+
+    target = _find_primary_pane()  # resolve to actual Primary pane id, not session name
+    is_pane = isinstance(target, str) and target.startswith("%")
+    if is_pane and _send_text(target, tagged):
+        _djournal("sent_inline", msg_id, pane=target)
+        # Sent into the live pane. Confirm-by-readback + nudge (replaces the old
+        # fixed 2.5s window); the queue row is cleared once the composer no longer
+        # holds our text, else the replay sweep redelivers on recovery.
+        asyncio.ensure_future(_deliver_and_confirm(tagged, needle, msg_id, initial_send=False))
+        return JSONResponse({"status": "sent", "delivered": "pending",
+                             "timestamp": int(time.time())})
+    else:
+        _djournal("inline_send_unavailable", msg_id, target=str(target))
+        # No live Primary pane, or send-keys failed. DO NOT report a false "sent"
+        # with the row already committed (that was the old 500-with-stranded-row
+        # bug). The message stays queued; a background retry re-resolves the pane
+        # and redelivers, and the startup replay sweep covers a full restart.
+        asyncio.ensure_future(_deliver_and_confirm(tagged, needle, msg_id, initial_send=True))
+        return JSONResponse({"status": "queued", "delivered": False,
+                             "note": "Primary is busy/unreachable — message stored and will be delivered on recovery.",
+                             "timestamp": int(time.time())})
 
 
 async def api_notify(request: Request) -> JSONResponse:
@@ -714,14 +1436,19 @@ async def api_notify(request: Request) -> JSONResponse:
     if not message:
         return JSONResponse({"error": "empty message"}, status_code=400)
 
-    entry = _save_portal_message(message, role="assistant")
+    source = str(body.get("source", "")).strip() or None
+    entry = _save_portal_message(message, role="assistant", source=source)
     return JSONResponse({"status": "saved", "id": entry["id"], "timestamp": entry["timestamp"]})
 
 
 async def ws_chat(websocket: WebSocket) -> None:
     """Stream new chat messages via WebSocket. Polls JSONL log for new entries."""
     token = websocket.query_params.get("token", "")
-    if token != BEARER_TOKEN:
+    # Accept the legacy single bearer token OR any per-operator token,
+    # matching REST check_auth(). Per-operator tokens (e.g. Russell's) were
+    # previously rejected with 4401, which the frontend treats as permanent
+    # (no reconnect) — leaving the chat with zero live message pushes.
+    if token != BEARER_TOKEN and token not in OPERATOR_TOKENS:
         await websocket.close(code=4401)
         return
 
@@ -735,6 +1462,7 @@ async def ws_chat(websocket: WebSocket) -> None:
         seen_texts[msg["id"]] = len(msg.get("text", ""))
 
     try:
+        _ping_counter = 0
         while True:
             messages = _parse_all_messages(last_n=200)
             for msg in messages:
@@ -752,6 +1480,11 @@ async def ws_chat(websocket: WebSocket) -> None:
                         continue  # Skip stray pipe/bracket/noise artifacts
                     _mirror_to_portal_log(msg)  # Persist so page refreshes don't lose messages
                     await websocket.send_text(json.dumps(msg))
+            # Keepalive ping every ~30s to prevent proxy timeout
+            _ping_counter += 1
+            if _ping_counter >= 37:
+                await websocket.send_text('{"type":"ping"}')
+                _ping_counter = 0
             await asyncio.sleep(0.8)  # Fast poll for near-real-time message delivery
     except (WebSocketDisconnect, Exception):
         pass
@@ -812,18 +1545,12 @@ async def api_chat_upload(request: Request) -> JSONResponse:
         notification = " ".join(notify_parts)
 
         session = get_tmux_session()
-        tmux_ok = False
-        try:
-            # Leading newline clears any partial input in buffer
-            subprocess.run(
-                ["tmux", "send-keys", "-t", session, "-l", f"\n{notification}"],
-                check=True, stderr=subprocess.DEVNULL
-            )
-            subprocess.run(
-                ["tmux", "send-keys", "-t", session, "Enter"],
-                check=True, stderr=subprocess.DEVNULL
-            )
-            tmux_ok = True
+        # LARGE-MESSAGE FIX (task#36): route through _send_text so the upload
+        # notification uses the same length-safe load-buffer/paste-buffer path
+        # (the old inline `send-keys -l` here had the identical >=16 KiB reject
+        # bug — a long caption/path could silently drop the whole notification).
+        tmux_ok = _send_text(session, notification)
+        if tmux_ok:
             # 5x Enter retries — ensures Claude processes even if busy
             async def _retry_enters():
                 for _ in range(5):
@@ -831,8 +1558,6 @@ async def api_chat_upload(request: Request) -> JSONResponse:
                     subprocess.run(["tmux", "send-keys", "-t", session, "Enter"],
                                    check=False, stderr=subprocess.DEVNULL)
             asyncio.ensure_future(_retry_enters())
-        except Exception:
-            pass  # Don't fail the upload if tmux injection fails
 
         # Auto-acknowledge in portal chat so user sees confirmation immediately
         ack_parts = [f"Received your file: {original_name}"]
@@ -1068,22 +1793,109 @@ async def _run_deploy():
         log(f"Deploy error: {e}")
 
 
-def _find_primary_pane():
-    """Find the tmux pane ID running the primary Claude Code instance."""
-    session = get_tmux_session()
+def _get_team_lead_pane_ids():
+    """Read Claude Code team configs to find all registered team lead pane IDs."""
+    team_panes = set()
     try:
-        # List all panes with their IDs
-        out = subprocess.check_output(
-            ["tmux", "list-panes", "-t", session, "-F", "#{pane_id}"],
+        teams_dir = Path.home() / ".claude" / "teams"
+        for config_path in teams_dir.glob("*/config.json"):
+            try:
+                with open(config_path) as f:
+                    config = json.load(f)
+                for member in config.get("members", []):
+                    pane_id = member.get("tmuxPaneId", "")
+                    if pane_id and pane_id.startswith("%"):
+                        team_panes.add(pane_id)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return team_panes
+
+
+def _score_pane_content(pane_id):
+    """Score pane content: positive for Primary markers, negative for team lead markers."""
+    try:
+        cap = subprocess.check_output(
+            ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-30"],
             stderr=subprocess.DEVNULL, text=True
         )
-        panes = [p.strip() for p in out.splitlines() if p.strip()]
-        if not panes:
+        score = 0
+        for marker in ["BOOP #", "[portal]", "Standing by", "sprint-mode",
+                        "leader-haiku", "margin/primary", "[SUPPORT REQUEST"]:
+            if marker in cap:
+                score += 1
+        for marker in ["You are being launched as", "Read your manifest:",
+                        "SendMessage results to Primary", "@fleet-lead",
+                        "@midwife-lead", "@infra-lead", "@dev-lead"]:
+            if marker in cap:
+                score -= 3
+        return score
+    except Exception:
+        return 0
+
+
+def _find_primary_pane():
+    """Find the tmux pane ID running the primary Claude Code instance (@main).
+
+    Strategy (layered):
+    1. BEST: Exclude team lead panes (from team config) — structural, immune to content
+    2. FALLBACK: Content scoring — Primary vs team lead markers
+    3. LAST RESORT: pane_index=0 in session
+    """
+    session = get_tmux_session()
+    try:
+        out = subprocess.check_output(
+            ["tmux", "list-panes", "-t", session, "-F",
+             "#{pane_id} #{pane_current_command} #{pane_index}"],
+            stderr=subprocess.DEVNULL, text=True
+        )
+
+        claude_panes = []  # (pane_id, pane_index)
+        index_zero_pane = None
+        for line in out.splitlines():
+            parts = line.strip().split()
+            if len(parts) < 3:
+                continue
+            pane_id, command, pane_idx = parts[0], parts[1], parts[2]
+            if "claude" in command:
+                claude_panes.append((pane_id, pane_idx))
+                if pane_idx == "0":
+                    index_zero_pane = pane_id
+
+        if not claude_panes:
             return session  # fallback to session target
 
-        # Primary is always the first pane (index 0)
-        # Team leads are spawned in subsequent panes
-        return panes[0]
+        if len(claude_panes) == 1:
+            return claude_panes[0][0]  # only one claude pane — must be primary
+
+        # Layer 1: Team config exclusion
+        team_lead_panes = _get_team_lead_pane_ids()
+        non_team_panes = [(pid, idx) for pid, idx in claude_panes if pid not in team_lead_panes]
+
+        if len(non_team_panes) == 1:
+            return non_team_panes[0][0]
+
+        # Layer 2: Content scoring
+        candidates = non_team_panes if non_team_panes else claude_panes
+        if len(candidates) > 1:
+            scored = []
+            for pane_id, pane_idx in candidates:
+                score = _score_pane_content(pane_id)
+                scored.append((score, pane_id))
+            scored.sort(reverse=True)
+            if scored[0][0] > scored[1][0]:  # clear winner
+                return scored[0][1]
+
+        # Layer 3: pane_index=0 fallback
+        if index_zero_pane:
+            return index_zero_pane
+
+        # Ultimate fallback: first non-team pane, or first claude pane
+        if non_team_panes:
+            return non_team_panes[0][0]
+        return claude_panes[0][0]
+
     except Exception:
         return session
 
@@ -1091,7 +1903,8 @@ def _find_primary_pane():
 async def ws_terminal(websocket: WebSocket) -> None:
     """Stream tmux pane content via WebSocket. Read-only."""
     token = websocket.query_params.get("token", "")
-    if token != BEARER_TOKEN:
+    # Accept legacy bearer OR any per-operator token, matching REST check_auth().
+    if token != BEARER_TOKEN and token not in OPERATOR_TOKENS:
         await websocket.close(code=4401)
         return
 
@@ -1100,6 +1913,8 @@ async def ws_terminal(websocket: WebSocket) -> None:
     last_content = ""
 
     try:
+        _ping_counter = 0
+        _reeval_counter = 0
         while True:
             try:
                 content = subprocess.check_output(
@@ -1113,9 +1928,80 @@ async def ws_terminal(websocket: WebSocket) -> None:
                 await websocket.send_text(content)
                 last_content = content
 
+            # Keepalive ping every ~30s to prevent proxy timeout
+            _ping_counter += 1
+            if _ping_counter >= 60:
+                await websocket.send_text('{"type":"ping"}')
+                _ping_counter = 0
+
+            # Re-evaluate pane target every ~30s to handle team lead lifecycle
+            _reeval_counter += 1
+            if _reeval_counter >= 60:  # 60 * 0.5s = 30s
+                new_target = _find_primary_pane()
+                if new_target != pane_target:
+                    pane_target = new_target
+                    last_content = ""  # force content refresh
+                _reeval_counter = 0
+
             await asyncio.sleep(0.5)
     except (WebSocketDisconnect, Exception):
         pass
+
+
+# P3 fix (2026-06-14): /api/context previously f.read() the ENTIRE multi-MB
+# session JSONL on every dashboard poll (pinned portal CPU ~85%). The usage
+# data we need is always near the END of the file, so we now tail-read the last
+# _CONTEXT_TAIL_BYTES and cache the parsed result for _CONTEXT_TTL seconds so
+# rapid polls don't re-read at all. Backup: portal_server.py.bak.p3-apicontext.*
+_CONTEXT_TAIL_BYTES = 262_144   # last 256 KB — always contains many usage entries
+_CONTEXT_TTL = 4.0              # seconds; rapid dashboard polls reuse this result
+_context_cache: dict = {}       # path -> (mtime, fsize, expires_at, result_dict)
+
+
+def _read_context_usage(latest):
+    """Tail-read the latest session JSONL and return usage dict.
+    Reads only the last 256 KB (vs the full multi-MB file), tolerates an
+    oversized partial first line, and never decode-errors."""
+    stat = latest.stat()
+    mtime = stat.st_mtime
+    fsize = stat.st_size
+    now = time.time()
+
+    cached = _context_cache.get(str(latest))
+    # Reuse cache if file unchanged OR within the short TTL window.
+    if cached:
+        c_mtime, c_fsize, c_expires, c_result = cached
+        if (c_mtime == mtime and c_fsize == fsize) or now < c_expires:
+            return c_result
+
+    input_tokens = 0
+    cache_read = 0
+    cache_creation = 0
+    with open(latest, "rb") as f:
+        if fsize > _CONTEXT_TAIL_BYTES:
+            f.seek(-_CONTEXT_TAIL_BYTES, 2)
+            f.readline()  # drop the (possibly partial) first line of the tail
+        raw = f.read()
+    # errors='ignore' so the ~112 KB oversized line / any byte split can't crash us
+    for line in reversed(raw.decode("utf-8", errors="ignore").splitlines()):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, KeyError):
+            continue  # partial/oversized line — skip gracefully
+        usage = entry.get("usage") or entry.get("message", {}).get("usage")
+        if usage and isinstance(usage, dict):
+            t = usage.get("input_tokens", 0)
+            if t:
+                input_tokens = t
+                cache_read = usage.get("cache_read_input_tokens", 0)
+                cache_creation = usage.get("cache_creation_input_tokens", 0)
+                break  # found last usage entry -- stop immediately
+
+    result = (input_tokens, cache_read, cache_creation)
+    _context_cache[str(latest)] = (mtime, fsize, now + _CONTEXT_TTL, result)
+    return result
 
 
 async def api_context(request: Request) -> JSONResponse:
@@ -1123,30 +2009,15 @@ async def api_context(request: Request) -> JSONResponse:
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     try:
-        MAX_TOKENS = 170_000  # ~30k reserved for responses/summaries
-        logs = sorted(LOG_ROOT.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+        MAX_TOKENS = 1_000_000  # Opus 4.6 with 1M context
+        log_root = _resolve_log_root()
+        logs = _sorted_session_logs(log_root)
         if not logs:
             return JSONResponse({"input_tokens": 0, "max_tokens": MAX_TOKENS, "pct": 0})
 
         latest = logs[0]
-        input_tokens = 0
-        cache_read = 0
-        cache_creation = 0
-
-        # Read last entry that has usage data
-        with open(latest) as f:
-            for line in f:
-                try:
-                    entry = json.loads(line)
-                    usage = entry.get("usage") or entry.get("message", {}).get("usage")
-                    if usage and isinstance(usage, dict):
-                        t = usage.get("input_tokens", 0)
-                        if t:
-                            input_tokens = t
-                            cache_read = usage.get("cache_read_input_tokens", 0)
-                            cache_creation = usage.get("cache_creation_input_tokens", 0)
-                except (json.JSONDecodeError, KeyError):
-                    continue
+        # Tail-read + TTL cache (P3): no more full-file read on every poll
+        input_tokens, cache_read, cache_creation = _read_context_usage(latest)
 
         total = input_tokens + cache_read + cache_creation
         pct = round(min(total / MAX_TOKENS * 100, 100), 1)
@@ -1158,20 +2029,61 @@ async def api_context(request: Request) -> JSONResponse:
             "max_tokens": MAX_TOKENS,
             "pct": pct,
             "session_id": latest.stem,
+            "model": "claude-opus-5-5[1m]",
         })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+_RESUME_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+# Env knobs restart-self.sh honours for TESTING; stripped so the portal always gets production gates.
+_RESUME_TEST_ENV_KEYS = ("PROJ_BASE", "IDENTITY_FILE", "MODEL", "RESUME_MAX_BYTES", "RESUME_MIN_BYTES",
+                         "MIN_TURNS", "RESUME_MAX_AGE_HOURS")
+
+
+def _pick_resume_target(script: "Path | None" = None, env_overrides: "dict | None" = None):
+    """Select the resume target with EXACTLY restart-self.sh's gates (added 2026-09-22).
+
+    Single source of truth: runs the shipped restart-self.sh in its read-only DRYRUN=1 mode
+    (it runs pick_resume_uuid and exits before touching any process/tmux/file) and parses
+    its DECISION line. Gates: own-project only, non-stub (MIN_TURNS), not crashed, not oversized
+    (>RESUME_MAX_BYTES 25MB), not stale (>RESUME_MAX_AGE_HOURS 12h). restart-self.sh is NOT
+    refactored because it is shipped self-contained to fleet CIVs via /from-witness/.
+    Returns (uuid_or_None, selection_line). Any failure -> (None, reason) -> FRESH (fail-safe).
+    """
+    script = Path(script) if script else Path.home() / "civ" / "tools" / "restart-self.sh"
+    if not script.is_file():
+        return None, f"selector-missing:{script}"
+    env = dict(os.environ)
+    for k in _RESUME_TEST_ENV_KEYS:
+        env.pop(k, None)
+    env.update(env_overrides or {})
+    env["DRYRUN"] = "1"
+    try:
+        out = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True,
+                             timeout=60).stdout
+    except Exception as e:  # timeout / exec failure -> fresh, never a blind resume
+        return None, f"selector-failed:{type(e).__name__}"
+    selection = next((l for l in out.splitlines() if l.startswith("Selection:")), "")
+    decision = next((l for l in out.splitlines() if l.startswith("DECISION:")), "")
+    parts = decision.split()
+    if len(parts) == 3 and parts[1] == "RESUME" and _RESUME_UUID_RE.match(parts[2]):
+        return parts[2], selection
+    if decision.startswith("DECISION: FRESH"):
+        return None, selection
+    return None, f"selector-unparsable:{decision[:80]!r}"
+
+
 async def api_resume(request: Request) -> JSONResponse:
-    """Launch a new Claude instance resuming the most recent conversation session."""
+    """Launch a new Claude instance resuming the newest VALID conversation session.
+
+    Target chosen by _pick_resume_target (restart-self.sh's gates). If no candidate passes,
+    start a FRESH memory-preserving session instead of resuming a stale/oversized/foreign/stub log.
+    """
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     try:
-        logs = sorted(LOG_ROOT.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if not logs:
-            return JSONResponse({"error": "no sessions found"}, status_code=404)
-        session_id = logs[0].stem  # UUID filename without .jsonl
+        session_id, selection = await asyncio.to_thread(_pick_resume_target)
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         tmux_session = f"{CIV_NAME}-primary-{timestamp}"
         project_dir = str(Path.home())
@@ -1190,15 +2102,16 @@ async def api_resume(request: Request) -> JSONResponse:
         # Write session name so portal can track it
         marker = Path.home() / ".current_session"
         marker.write_text(tmux_session)
-        claude_cmd = (
-            f"claude --model claude-sonnet-4-6 --dangerously-skip-permissions "
-            f"--resume {session_id}"
-        )
+        claude_cmd = "claude --model 'claude-opus-5-5[1m]' --dangerously-skip-permissions"
+        if session_id:
+            claude_cmd += f" --resume {session_id}"
         subprocess.Popen(
             ["tmux", "new-session", "-d", "-s", tmux_session, "-c", project_dir, claude_cmd],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-        return JSONResponse({"status": "resuming", "session_id": session_id, "tmux": tmux_session})
+        return JSONResponse({"status": "resuming" if session_id else "fresh",
+                             "session_id": session_id, "tmux": tmux_session,
+                             "selection": selection})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -1304,6 +2217,22 @@ async def api_inject_pane(request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid json"}, status_code=400)
     pane_id = body.get("pane_id", "").strip()
     message = body.get("message", "").strip()
+    # PROBE LOGGING — catch ANY message containing "PROBE" for investigation
+    if "PROBE" in message.upper():
+        import datetime as _dt, logging as _logging, json as _json
+        _client = request.client.host if request.client else "unknown"
+        _headers = dict(request.headers)
+        _log_entry = {
+            "timestamp": _dt.datetime.utcnow().isoformat() + "Z",
+            "endpoint": "inject_pane",
+            "client_ip": _client,
+            "pane_id": pane_id,
+            "message": message[:500],
+            "headers": _headers,
+        }
+        with open("/tmp/probe-trace.log", "a") as _f:
+            _f.write(_json.dumps(_log_entry) + "\n")
+        _logging.getLogger("uvicorn.error").warning("PROBE via inject_pane: client=%s pane=%s msg=%s headers=%s", _client, pane_id, message[:120], _json.dumps(_headers))
     if not pane_id or not message:
         return JSONResponse({"error": "pane_id and message required"}, status_code=400)
     try:
@@ -1526,77 +2455,113 @@ def _is_claude_running_in_pane(pane: str) -> bool:
         return False
 
 
-async def api_claude_auth_start(request: Request) -> JSONResponse:
-    """Inject /login into the Claude tmux session to start OAuth flow.
+AUTH_PANE_NAME = "auth-pane"
 
-    If Claude Code is not running in the pane (e.g. fresh container with only
-    a bash shell), starts Claude first and waits for it to be ready before
-    sending /login.
+
+def _get_or_create_auth_pane() -> str:
+    """Create a dedicated tmux window for the OAuth flow.
+
+    Returns the pane target string (e.g. 'jada-primary:auth-pane').
+    Always kills any stale auth window first, then creates a fresh one
+    with zero scrollback history. This guarantees no stale OAuth URLs
+    or error text from prior attempts.
+    """
+    session = get_tmux_session()
+    # On fresh containers the session might be the portal's own — create a
+    # proper Claude session the same way auth_start used to.
+    if "portal" in session.lower():
+        session = f"{CIV_NAME}-primary"
+        subprocess.run(["tmux", "new-session", "-d", "-s", session],
+                       stderr=subprocess.DEVNULL)
+        time.sleep(0.5)
+
+    target = f"{session}:{AUTH_PANE_NAME}"
+
+    # Kill any leftover auth window from a prior attempt
+    subprocess.run(["tmux", "kill-window", "-t", target],
+                   stderr=subprocess.DEVNULL)
+    time.sleep(0.3)
+
+    # Create a brand-new window with a clean shell
+    subprocess.run(["tmux", "new-window", "-t", session, "-n", AUTH_PANE_NAME],
+                   check=True, stderr=subprocess.DEVNULL)
+    time.sleep(0.3)
+
+    # Widen to 500 cols so OAuth URLs don't wrap
+    subprocess.run(["tmux", "resize-window", "-t", target, "-x", "500"],
+                   stderr=subprocess.DEVNULL)
+
+    # Clear any initial shell output / MOTD
+    subprocess.run(["tmux", "clear-history", "-t", target],
+                   stderr=subprocess.DEVNULL)
+
+    return target
+
+
+def _cleanup_auth_pane() -> None:
+    """Kill the dedicated auth pane after OAuth completes."""
+    session = get_tmux_session()
+    if "portal" in session.lower():
+        session = f"{CIV_NAME}-primary"
+    target = f"{session}:{AUTH_PANE_NAME}"
+    subprocess.run(["tmux", "kill-window", "-t", target],
+                   stderr=subprocess.DEVNULL)
+
+
+async def api_claude_auth_start(request: Request) -> JSONResponse:
+    """Start OAuth by launching `claude /login` in a DEDICATED auth pane.
+
+    Creates a fresh tmux window ('auth-pane') with zero history so there is
+    no stale output to confuse URL scraping. If Claude Code is not running
+    in the auth pane, starts it first.
     """
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     global _captured_oauth_url
     _captured_oauth_url = None
 
-    # Ensure a dedicated Claude tmux session exists.
-    # On fresh containers, only 'portal-server' exists — we can't inject
-    # Claude into the portal's own pane (it's running the Python server).
-    session = get_tmux_session()
-    if "portal" in session.lower():
-        claude_session = f"{CIV_NAME}-primary"
-        subprocess.run(["tmux", "new-session", "-d", "-s", claude_session],
-                       stderr=subprocess.DEVNULL)
-        time.sleep(0.5)
-        session = claude_session
-
-    pane = _find_primary_pane()
-    _save_portal_message(f"🔐 Auth flow started — checking Claude in {session} (pane {pane})", role="assistant")
     try:
-        # CRITICAL: Resize tmux window to 500 cols BEFORE sending /login.
-        # Claude prints the OAuth URL as one long line — if the window is narrow
-        # (e.g. 80 cols), the URL wraps and tmux capture-pane -J can't reliably
-        # un-wrap it. At 500 cols the URL fits on one line, no wrapping, clean capture.
-        subprocess.run(["tmux", "resize-window", "-t", pane, "-x", "500"],
-                       stderr=subprocess.DEVNULL)
-        time.sleep(0.3)
+        auth_pane = _get_or_create_auth_pane()
+    except subprocess.CalledProcessError as e:
+        _save_portal_message(f"❌ Auth start failed: could not create auth pane — {e}", role="assistant")
+        return JSONResponse({"error": f"tmux error creating auth pane: {e}"}, status_code=500)
 
-        # If Claude Code is NOT running in the pane (e.g. bare bash shell on
-        # a fresh container), start it first and wait for it to be ready.
-        if not _is_claude_running_in_pane(pane):
-            _save_portal_message("🚀 Claude not running — starting Claude Code in tmux...", role="assistant")
-            subprocess.run(["tmux", "send-keys", "-t", pane, "-l",
-                            "claude --dangerously-skip-permissions"],
-                           check=True, stderr=subprocess.DEVNULL)
-            subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"],
-                           check=True, stderr=subprocess.DEVNULL)
-            # Poll until Claude is the active process (up to 30 seconds)
-            for _ in range(60):
-                time.sleep(0.5)
-                if _is_claude_running_in_pane(pane):
-                    break
-            else:
-                _save_portal_message("⚠️ Claude didn't start within 30s — sending /login anyway", role="assistant")
-            # Give Claude a moment to fully render its prompt
-            time.sleep(3)
-
-        subprocess.run(["tmux", "send-keys", "-t", pane, "-l", "/login"],
+    _save_portal_message(f"🔐 Auth flow started — dedicated auth pane: {auth_pane}", role="assistant")
+    try:
+        # Start Claude Code in the auth pane (it's a fresh bash shell)
+        subprocess.run(["tmux", "send-keys", "-t", auth_pane, "-l",
+                        "claude --dangerously-skip-permissions"],
                        check=True, stderr=subprocess.DEVNULL)
-        subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"],
+        subprocess.run(["tmux", "send-keys", "-t", auth_pane, "Enter"],
+                       check=True, stderr=subprocess.DEVNULL)
+        # Poll until Claude is the active process (up to 30 seconds)
+        for _ in range(60):
+            time.sleep(0.5)
+            if _is_claude_running_in_pane(auth_pane):
+                break
+        else:
+            _save_portal_message("⚠️ Claude didn't start within 30s — sending /login anyway", role="assistant")
+        # Give Claude a moment to fully render its prompt
+        time.sleep(3)
+
+        subprocess.run(["tmux", "send-keys", "-t", auth_pane, "-l", "/login"],
+                       check=True, stderr=subprocess.DEVNULL)
+        subprocess.run(["tmux", "send-keys", "-t", auth_pane, "Enter"],
                        check=True, stderr=subprocess.DEVNULL)
         # Wait for the 3-option login menu to render, then press Enter
         # to auto-select option 1 (already highlighted by default)
         time.sleep(2)
-        subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"],
+        subprocess.run(["tmux", "send-keys", "-t", auth_pane, "Enter"],
                        check=False, stderr=subprocess.DEVNULL)
-        _save_portal_message("⏳ /login sent — waiting for OAuth URL to appear in terminal...", role="assistant")
+        _save_portal_message("⏳ /login sent in auth pane — waiting for OAuth URL...", role="assistant")
         return JSONResponse({"started": True})
     except subprocess.CalledProcessError as e:
-        _save_portal_message(f"❌ Auth start failed: tmux error — pane={pane}, err={e}", role="assistant")
+        _save_portal_message(f"❌ Auth start failed: tmux error — pane={auth_pane}, err={e}", role="assistant")
         return JSONResponse({"error": f"tmux error: {e}"}, status_code=500)
 
 
 async def api_claude_auth_code(request: Request) -> JSONResponse:
-    """Inject the OAuth authorization code into the Claude tmux session."""
+    """Inject the OAuth authorization code into the dedicated auth pane."""
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     try:
@@ -1606,49 +2571,71 @@ async def api_claude_auth_code(request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid json"}, status_code=400)
     if not code:
         return JSONResponse({"error": "empty code"}, status_code=400)
-    pane = _find_primary_pane()
-    _save_portal_message(f"⌨️ Auth code submitted — injecting into {get_tmux_session()}...", role="assistant")
+
+    session = get_tmux_session()
+    if "portal" in session.lower():
+        session = f"{CIV_NAME}-primary"
+    auth_pane = f"{session}:{AUTH_PANE_NAME}"
+
+    _save_portal_message(f"⌨️ Auth code submitted — injecting into auth pane...", role="assistant")
     try:
-        subprocess.run(["tmux", "send-keys", "-t", pane, "-l", code],
+        subprocess.run(["tmux", "send-keys", "-t", auth_pane, "-l", code],
                        check=True, stderr=subprocess.DEVNULL)
-        subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"],
+        subprocess.run(["tmux", "send-keys", "-t", auth_pane, "Enter"],
                        check=True, stderr=subprocess.DEVNULL)
         # Mark that a human has completed the OAuth flow via the portal.
-        # This lets api_claude_auth_status trust the credentials file.
         HUMAN_AUTH_MARKER.write_text(f"human-auth-initiated:{int(time.time())}")
-        _save_portal_message("✅ Code injected — Claude is authenticating...", role="assistant")
+        _save_portal_message("✅ Code injected — Claude is authenticating in auth pane...", role="assistant")
+
+        # Wait briefly for auth to complete, then clean up the auth pane.
+        # The credentials file is written by Claude regardless of which pane
+        # it runs in — the primary session picks them up automatically.
+        await asyncio.sleep(5)
+        _cleanup_auth_pane()
+        _save_portal_message("🧹 Auth pane cleaned up — credentials saved.", role="assistant")
+
         return JSONResponse({"injected": True})
     except subprocess.CalledProcessError as e:
-        _save_portal_message(f"❌ Code injection failed: tmux error — pane={pane}, err={e}", role="assistant")
+        _save_portal_message(f"❌ Code injection failed: tmux error — pane={auth_pane}, err={e}", role="assistant")
         return JSONResponse({"error": f"tmux error: {e}"}, status_code=500)
 
 
 async def api_claude_auth_url(request: Request) -> JSONResponse:
-    """Poll for the captured OAuth URL from tmux output."""
+    """Poll for the captured OAuth URL from the dedicated auth pane."""
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     global _captured_oauth_url
     if _captured_oauth_url:
         return JSONResponse({"url": _captured_oauth_url, "ready": True})
-    pane = _find_primary_pane()
+
+    session = get_tmux_session()
+    if "portal" in session.lower():
+        session = f"{CIV_NAME}-primary"
+    auth_pane = f"{session}:{AUTH_PANE_NAME}"
+
     try:
         # -J joins wrapped lines so long URLs aren't truncated at terminal width
         content = subprocess.check_output(
-            ["tmux", "capture-pane", "-t", pane, "-p", "-J", "-S", "-200"],
+            ["tmux", "capture-pane", "-t", auth_pane, "-p", "-J", "-S", "-200"],
             stderr=subprocess.DEVNULL, text=True
         )
         match = OAUTH_URL_PATTERN.search(content)
         if match:
             candidate = match.group(0).strip()
             # Validate URL is complete — must contain state= parameter.
-            # A truncated URL is worse than no URL (causes "missing state" error on claude.ai).
             if "state=" not in candidate:
-                _save_portal_message(f"⚠️ OAuth URL found but truncated (missing state=) — retrying capture", role="assistant")
+                _save_portal_message("⚠️ OAuth URL found but truncated (missing state=) — retrying capture", role="assistant")
             else:
                 _captured_oauth_url = candidate
                 _save_portal_message(f"🔗 OAuth URL ready ({len(candidate)} chars, state= confirmed)", role="assistant")
                 return JSONResponse({"url": _captured_oauth_url, "ready": True})
-        # Silently return — no notification on each poll. Only notify when URL is found.
+        # Check for error patterns in the auth pane (no stale output concern
+        # since the pane was created fresh for this auth attempt)
+        if "error" in content.lower() and "oauth" in content.lower():
+            _save_portal_message("⚠️ OAuth error detected in auth pane — may need to retry", role="assistant")
+    except subprocess.CalledProcessError:
+        # Auth pane doesn't exist yet or was killed — silently wait
+        pass
     except Exception as e:
         _save_portal_message(f"❌ tmux capture failed: {e}", role="assistant")
     return JSONResponse({"url": None, "ready": False})
@@ -1685,7 +2672,8 @@ async def _thinking_monitor_loop() -> None:
     while True:
         try:
             # Find the most recently modified JSONL session file
-            logs = sorted(LOG_ROOT.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+            log_root = _resolve_log_root()
+            logs = _sorted_session_logs(log_root)
             if not logs:
                 await asyncio.sleep(2)
                 continue
@@ -1789,6 +2777,12 @@ async def _startup() -> None:
     """Start background tasks on server startup."""
     _init_portal_log_ids()
     asyncio.create_task(_thinking_monitor_loop())
+    # task#36: redeliver any portal messages that were queued-but-not-confirmed
+    # before this (re)start, so an outage / restart can't black-hole them.
+    asyncio.create_task(_replay_pending_deliveries())
+    # task#36: periodic drain so a message stuck past the 120s window is retried
+    # WITHOUT waiting for a restart.
+    asyncio.create_task(_periodic_delivery_sweep())
 
 
 # ---------------------------------------------------------------------------
@@ -2258,21 +3252,30 @@ async def api_margin(request: Request, path: Path, author: str) -> JSONResponse:
         if not path.exists():
             return []
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            feed = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, ValueError):
             return []
+        # Normalize: some entries were written directly with "text" or "note"
+        # instead of "content". Ensure every entry has "content" for the frontend.
+        for entry in feed:
+            if not entry.get("content"):
+                entry["content"] = entry.get("text") or entry.get("note") or ""
+        return feed
 
     if request.method == "POST":
         try:
             body = await request.json()
-            content = body.get("content", "").strip()
+            content = (body.get("content") or body.get("text") or "").strip()
             if not content:
                 return JSONResponse({"error": "empty content"}, status_code=400)
+            boop_id = body.get("boop_id")
             entry = {
                 "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "author": author,
                 "content": content,
             }
+            if boop_id:
+                entry["boop_id"] = str(boop_id)
             feed = _read_feed()
             feed.append(entry)
             path.write_text(json.dumps(feed, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -2292,6 +3295,580 @@ async def api_margin_primary(request: Request) -> JSONResponse:
 
 async def api_margin_corey(request: Request) -> JSONResponse:
     return await api_margin(request, MARGIN_COREY, "corey")
+
+
+# ---------------------------------------------------------------------------
+# Points (ledger — read-only from portal)
+# ---------------------------------------------------------------------------
+POINTS_LEDGER = Path("/home/aiciv/projects/points/points.jsonl")
+
+
+async def api_points_summary(request: Request) -> JSONResponse:
+    """Aggregate points totals from the JSONL ledger."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    totals: dict[str, int] = {}
+    if POINTS_LEDGER.exists():
+        for line in POINTS_LEDGER.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                to = rec.get("to", "unknown")
+                delta = int(rec.get("delta", 0))
+                totals[to] = totals.get(to, 0) + delta
+            except (json.JSONDecodeError, ValueError):
+                continue
+    # Bucket into primary / corey / team_leads
+    primary = totals.pop("primary", 0)
+    corey = totals.pop("corey", 0)
+    team_leads = sum(totals.values())
+    return JSONResponse({"primary": primary, "corey": corey, "team_leads": team_leads})
+
+
+async def api_points_history(request: Request) -> JSONResponse:
+    """Return full points history (most recent first)."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    entries: list[dict] = []
+    if POINTS_LEDGER.exists():
+        for line in POINTS_LEDGER.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                entries.append({
+                    "timestamp": rec.get("timestamp") or rec.get("ts", ""),
+                    "recipient": rec.get("to", "unknown"),
+                    "amount": int(rec.get("delta", 0)),
+                    "note": rec.get("note", ""),
+                })
+            except (json.JSONDecodeError, ValueError):
+                continue
+    entries.reverse()
+    return JSONResponse(entries)
+
+
+# ---------------------------------------------------------------------------
+# Fleet-Intel human dashboard (read-only over civ/data/witness-fleet.db)
+# ---------------------------------------------------------------------------
+# Additive, read-only. Surfaces DERIVED SIGNAL already present in the fleet-intel
+# sweep DB. Never re-reads raw CIV content. All numbers derived LIVE per request
+# from read-only SELECTs on the latest sweep_date. Handles the nested 'metrics'
+# JSON blob and mixed/null column types defensively.
+import sqlite3 as _sqlite3
+
+FLEET_INTEL_DB = Path.home() / "civ" / "data" / "witness-fleet.db"
+
+
+def _fi_connect():
+    """Open the fleet-intel DB strictly read-only (immutable=off, mode=ro)."""
+    uri = f"file:{FLEET_INTEL_DB}?mode=ro"
+    conn = _sqlite3.connect(uri, uri=True, timeout=5)
+    conn.row_factory = _sqlite3.Row
+    return conn
+
+
+def _fi_truthy(v):
+    """Defensive truthiness for mixed-type/null boolean columns (int/str/None)."""
+    if v is None:
+        return False
+    if isinstance(v, (int, float)):
+        return v != 0
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "t", "y")
+    return bool(v)
+
+
+def _fi_model_below_floor(model):
+    """True if running_model is BELOW the 4.8 constitutional floor.
+
+    Floor-OK: anything on 4-8 (incl [1m]) or the bare 'opus' alias.
+    Below-floor: 4-6 variants and other explicitly-old models.
+    Unknown/None models are NOT counted as below-floor (they're 'unknown').
+    """
+    if not model:
+        return False
+    m = str(model).lower()
+    if "4-8" in m or "4.8" in m:
+        return False
+    if m == "opus":  # bare alias resolves to current default (>= floor)
+        return False
+    if "4-6" in m or "4.6" in m or "4-5" in m or "sonnet" in m:
+        return True
+    # Fable / newer named models are not below the 4.8 floor
+    if "fable" in m:
+        return False
+    return False
+
+
+def _fi_latest_date(conn):
+    row = conn.execute("SELECT MAX(sweep_date) AS d FROM fleet_intel").fetchone()
+    return row["d"] if row else None
+
+
+# ---- CC-version cross-ref helpers (binary vs config) ----
+# The sensor stores cc_version nested inside the per-row 'metrics' JSON blob.
+# We recurse to find the first 2.1.x version string. The CC binary floor for
+# Opus 4.8 is 2.1.170. Below that -> the BINARY is the constraint. At/above
+# but still on 4-6 -> the model is config-pinned (or a stale in-memory process
+# holds an old binary even after the on-disk upgrade).
+_CC_FLOOR = 170
+
+
+def _fi_find_cc(d):
+    """Recursively pull the first 2.1.x version string out of a metrics blob."""
+    if isinstance(d, dict):
+        for k, v in d.items():
+            if re.search(r'cc_version|claude_version|cli_version|version', str(k), re.I):
+                m = re.search(r'2\.1\.\d+', str(v))
+                if m:
+                    return m.group(0)
+            r = _fi_find_cc(v)
+            if r:
+                return r
+    elif isinstance(d, (list, tuple)):
+        for v in d:
+            r = _fi_find_cc(v)
+            if r:
+                return r
+    elif isinstance(d, str):
+        m = re.search(r'2\.1\.\d+', d)
+        if m:
+            return m.group(0)
+    return None
+
+
+def _fi_cc_below_floor(ver):
+    """True if a 2.1.x version is below the 2.1.170 binary floor. None if unknown."""
+    m = re.search(r'2\.1\.(\d+)', ver or '')
+    return int(m.group(1)) < _CC_FLOOR if m else None
+
+
+def _fi_is_46(model):
+    """True if the running_model string names an opus-4-6 variant."""
+    m = str(model or '').lower()
+    return '4-6' in m or '4.6' in m
+
+
+def _fi_cc_row_version(r):
+    """Extract cc_version for one fleet_intel row from its metrics JSON blob."""
+    raw = r.get("metrics")
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return None
+    return _fi_find_cc(parsed)
+
+
+def _fi_cc_crossref(rows):
+    """Classify the opus-4-6 CIVs by WHY they're below the 4.8 floor:
+      old_binary     -> cc < 2.1.170 (binary itself needs upgrading)
+      hard_pinned    -> cc >= 2.1.170 but still 4-6 (config-pinned OR stale process)
+      binary_unknown -> cc could not be read from metrics
+    """
+    old_binary = []
+    hard_pinned = []
+    binary_unknown = 0
+    for r in rows:
+        if not _fi_is_46(r.get("running_model")):
+            continue
+        cc = _fi_cc_row_version(r)
+        bf = _fi_cc_below_floor(cc)
+        if bf is True:
+            old_binary.append({"civ": r.get("civ"), "cc": cc})
+        elif bf is False:
+            hard_pinned.append({
+                "civ": r.get("civ"),
+                "running_model": r.get("running_model"),
+                "cc": cc,
+            })
+        else:
+            binary_unknown += 1
+    old_binary.sort(key=lambda x: str(x.get("civ") or "").lower())
+    hard_pinned.sort(key=lambda x: str(x.get("civ") or "").lower())
+    return {
+        "old_binary": {"count": len(old_binary), "civs": old_binary},
+        "hard_pinned": {"count": len(hard_pinned), "civs": hard_pinned},
+        "binary_unknown": {"count": binary_unknown},
+    }
+
+
+def _fi_below_floor_trend(conn, nights=10):
+    """Per-sweep_date total_civs vs below_floor_count over the last N nights,
+    chronological. below_floor here = running_model names a 4-6 variant."""
+    dates = [r["d"] for r in conn.execute(
+        "SELECT DISTINCT sweep_date AS d FROM fleet_intel "
+        "ORDER BY sweep_date DESC LIMIT ?", (nights,)).fetchall()]
+    dates.reverse()  # chronological
+    out = []
+    for d in dates:
+        rows = conn.execute(
+            "SELECT running_model FROM fleet_intel WHERE sweep_date = ?",
+            (d,)).fetchall()
+        total = len(rows)
+        below = sum(1 for r in rows if _fi_is_46(r["running_model"]))
+        out.append({"sweep_date": d, "total_civs": total,
+                    "below_floor_count": below})
+    return out
+
+
+def _fi_build(limit_lists=50):
+    """Build the full fleet-intel payload from the latest sweep. Read-only."""
+    conn = _fi_connect()
+    try:
+        latest = _fi_latest_date(conn)
+        if not latest:
+            return {"error": "no sweep data", "latest_sweep": None,
+                    "rollup": {}, "below_floor": [], "engagement_slip": []}
+
+        rows = conn.execute(
+            "SELECT * FROM fleet_intel WHERE sweep_date = ?", (latest,)
+        ).fetchall()
+        rows = [dict(r) for r in rows]
+
+        # ---- Rollup ----
+        total = len(rows)
+        healthy = sum(1 for r in rows if _fi_truthy(r.get("healthy")))
+        model_correct = sum(1 for r in rows if _fi_truthy(r.get("model_correct")))
+        below_floor_count = sum(
+            1 for r in rows if _fi_model_below_floor(r.get("running_model")))
+        claude_alive = sum(1 for r in rows if _fi_truthy(r.get("claude_alive")))
+        portal_alive = sum(1 for r in rows if _fi_truthy(r.get("portal_alive")))
+
+        # model distribution (live, not hardcoded)
+        model_dist = {}
+        for r in rows:
+            mk = r.get("running_model") or "None"
+            model_dist[mk] = model_dist.get(mk, 0) + 1
+        model_dist = dict(sorted(model_dist.items(), key=lambda kv: -kv[1]))
+
+        rollup = {
+            "total_civs": total,
+            "healthy": healthy,
+            "model_correct": model_correct,
+            "below_floor_count": below_floor_count,
+            "claude_alive": claude_alive,
+            "portal_alive": portal_alive,
+            "latest_sweep": latest,
+            "model_distribution": model_dist,
+        }
+
+        # ---- CC-below-floor list (headline gold) ----
+        below = [r for r in rows if _fi_model_below_floor(r.get("running_model"))]
+
+        def _num(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return -1
+
+        below.sort(key=lambda r: (str(r.get("running_model") or ""),
+                                   str(r.get("civ") or "")))
+        below_floor = [{
+            "container": r.get("container"),
+            "civ": r.get("civ"),
+            "owner": r.get("owner"),
+            "owner_email": r.get("owner_email"),
+            "running_model": r.get("running_model"),
+            "host": r.get("host"),
+            "model_correct": _fi_truthy(r.get("model_correct")),
+        } for r in below[:limit_lists]]
+
+        # ---- Engagement-slip watchlist ----
+        def _slip_key(r):
+            return (_num(r.get("engagement_slip_streak")),
+                    _num(r.get("days_since_human_msg")))
+        watch = sorted(rows, key=_slip_key, reverse=True)
+        engagement_slip = []
+        for r in watch[:limit_lists]:
+            streak = _num(r.get("engagement_slip_streak"))
+            dshm = _num(r.get("days_since_human_msg"))
+            if streak <= 0 and dshm <= 0:
+                continue  # nothing notable
+            engagement_slip.append({
+                "container": r.get("container"),
+                "civ": r.get("civ"),
+                "owner": r.get("owner"),
+                "engagement_class": r.get("engagement_class"),
+                "engagement_slip_streak": r.get("engagement_slip_streak"),
+                "days_since_human_msg": r.get("days_since_human_msg"),
+                "days_since_engagement_delta": r.get("days_since_engagement_delta"),
+                "time_since_last_use": r.get("time_since_last_use"),
+                "boop_cadence_ok": _fi_truthy(r.get("boop_cadence_ok")),
+            })
+
+        # ---- CC-version cross-ref (binary vs config) ----
+        cc_crossref = _fi_cc_crossref(rows)
+
+        # ---- Below-floor night-over-night trend ----
+        trend = _fi_below_floor_trend(conn, nights=10)
+
+        return {
+            "latest_sweep": latest,
+            "rollup": rollup,
+            "below_floor": below_floor,
+            "engagement_slip": engagement_slip,
+            "cc_crossref": cc_crossref,
+            "trend": trend,
+            "generated_at": int(time.time()),
+        }
+    finally:
+        conn.close()
+
+
+def _fi_civ_detail(container):
+    """Return the full latest-night row for one container (by container id or civ name)."""
+    conn = _fi_connect()
+    try:
+        latest = _fi_latest_date(conn)
+        if not latest:
+            return None
+        row = conn.execute(
+            "SELECT * FROM fleet_intel WHERE sweep_date = ? AND container = ? LIMIT 1",
+            (latest, container),
+        ).fetchone()
+        if row is None:
+            row = conn.execute(
+                "SELECT * FROM fleet_intel WHERE sweep_date = ? AND civ = ? LIMIT 1",
+                (latest, container),
+            ).fetchone()
+        if row is None:
+            return None
+        rec = dict(row)
+        # Pretty-parse the nested metrics blob defensively (may be null/partial).
+        raw_metrics = rec.get("metrics")
+        parsed = None
+        if raw_metrics:
+            try:
+                parsed = json.loads(raw_metrics)
+            except Exception:
+                parsed = {"_unparsed": str(raw_metrics)[:2000]}
+        rec["metrics_parsed"] = parsed
+        return rec
+    finally:
+        conn.close()
+
+
+async def api_fleet_intel(request: Request) -> JSONResponse:
+    """JSON fleet-intel payload (latest sweep). Auth: same bearer pattern."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    civ = request.query_params.get("civ") or request.query_params.get("container")
+    try:
+        if civ:
+            detail = _fi_civ_detail(civ)
+            if detail is None:
+                return JSONResponse({"error": "not found", "civ": civ}, status_code=404)
+            return JSONResponse({"detail": detail})
+        return JSONResponse(_fi_build())
+    except Exception as e:
+        return JSONResponse({"error": f"fleet-intel error: {e}"}, status_code=500)
+
+
+_FLEET_INTEL_HTML = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Witness Fleet-Intel</title>
+<style>
+:root{--bg:#0d0f14;--panel:#161a22;--panel2:#1d222c;--line:#2a3140;--fg:#e6e9ef;--dim:#8b93a3;--accent:#6ea8fe;--red:#ff6b6b;--amber:#ffc857;--green:#54d18c}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}
+header{padding:18px 24px;border-bottom:1px solid var(--line);display:flex;align-items:baseline;gap:16px;flex-wrap:wrap}
+h1{font-size:18px;margin:0;font-weight:600}
+.sweep{color:var(--dim);font-size:13px}
+main{padding:20px 24px;max-width:1200px;margin:0 auto}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:24px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.card .n{font-size:26px;font-weight:700}.card .l{color:var(--dim);font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+.card.warn .n{color:var(--red)}
+section{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-bottom:22px;overflow:hidden}
+section>h2{font-size:14px;margin:0;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--panel2);font-weight:600}
+section>h2 .sub{color:var(--dim);font-weight:400;font-size:12px;margin-left:8px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:9px 16px;border-bottom:1px solid var(--line)}
+th{color:var(--dim);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+tr.clk{cursor:pointer}tr.clk:hover td{background:var(--panel2)}
+.pill{display:inline-block;padding:1px 8px;border-radius:20px;font-size:11px;border:1px solid var(--line)}
+.pill.bad{color:var(--red);border-color:var(--red)}.pill.ok{color:var(--green);border-color:var(--green)}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.dist{display:flex;flex-wrap:wrap;gap:8px;padding:12px 16px}
+.dist .d{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:4px 10px;font-size:12px}
+.dist .d.below{border-color:var(--red);color:var(--red)}
+#detail{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:flex-start;justify-content:center;padding:40px 16px;overflow:auto;z-index:50}
+#detail.show{display:flex}
+#detailBox{background:var(--panel);border:1px solid var(--line);border-radius:12px;max-width:820px;width:100%;padding:20px}
+#detailBox h3{margin:0 0 12px}
+#detailBox pre{background:#0a0c10;border:1px solid var(--line);border-radius:8px;padding:14px;overflow:auto;font-size:12px;max-height:60vh}
+.x{float:right;cursor:pointer;color:var(--dim);font-size:20px;line-height:1}
+.err{color:var(--red);padding:20px}
+.muted{color:var(--dim)}
+.trend{display:flex;flex-wrap:wrap;gap:6px;padding:12px 16px;align-items:center}
+.trend .tp{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:4px 9px;font-size:12px;white-space:nowrap}
+.trend .tp b{font-weight:600;color:var(--dim);margin-right:4px}
+.trend .tp.hi{border-color:var(--red);color:var(--red)}
+.trend .tp.mid{border-color:var(--amber);color:var(--amber)}
+.trend .tp.lo{border-color:var(--green);color:var(--green)}
+.ccwrap{padding:8px 16px 4px}
+.ccsub{margin:10px 0 6px}
+.ccsub h4{margin:0 0 8px;font-size:13px;font-weight:600}
+.ccsub h4 .sub2{color:var(--dim);font-weight:400;font-size:12px;margin-left:8px}
+.chips{display:flex;flex-wrap:wrap;gap:8px}
+.chip{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
+.chip:hover{border-color:var(--accent)}
+.footnote{color:var(--dim);font-size:11.5px;padding:6px 16px 14px;line-height:1.5;border-top:1px solid var(--line);margin:8px 0 0}
+</style></head>
+<body>
+<div style="padding:20px 24px;border-bottom:1px solid var(--line);background:linear-gradient(90deg,var(--panel2),var(--panel));text-align:center">
+  <h1 style="font-size:22px;font-weight:700;margin:0;letter-spacing:.02em;color:var(--accent)">Longitudinal data worth more than gold</h1>
+</div>
+<header><h1>Witness Fleet-Intel</h1><span class="sweep" id="sweep">loading...</span>
+<span class="muted" style="margin-left:auto;font-size:12px">read-only derived signal · witness-fleet.db</span></header>
+<main id="main"><p class="muted">Loading fleet-intel...</p></main>
+<div id="detail" onclick="if(event.target===this)closeDetail()">
+  <div id="detailBox"><span class="x" onclick="closeDetail()">&times;</span>
+  <h3 id="detailTitle"></h3><pre id="detailPre"></pre></div>
+</div>
+<script>
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
+const H = {'Authorization':'Bearer '+TOKEN};
+function esc(s){return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+async function load(){
+  let r;
+  try{ r = await fetch('/api/fleet-intel',{headers:H}); }
+  catch(e){ document.getElementById('main').innerHTML='<p class="err">Network error: '+esc(e)+'</p>'; return; }
+  if(r.status===401){ document.getElementById('main').innerHTML='<p class="err">Unauthorized — append ?token=YOUR_TOKEN to the URL.</p>'; return; }
+  const d = await r.json();
+  if(d.error){ document.getElementById('main').innerHTML='<p class="err">'+esc(d.error)+'</p>'; return; }
+  render(d);
+}
+function render(d){
+  const ru=d.rollup||{};
+  document.getElementById('sweep').textContent='latest sweep: '+esc(d.latest_sweep);
+  let dist='';
+  for(const [k,v] of Object.entries(ru.model_distribution||{})){
+    const below=/4-6|4\\.6|4-5|sonnet/i.test(k);
+    dist+='<span class="d'+(below?' below':'')+'">'+esc(k)+' · '+v+'</span>';
+  }
+  let h='';
+  h+='<div class="cards">'
+    +card('Total CIVs',ru.total_civs)
+    +card('Healthy',ru.healthy)
+    +card('Model-correct',ru.model_correct)
+    +card('Below 4.8 floor',ru.below_floor_count,true)
+    +card('Claude alive',ru.claude_alive)
+    +card('Portal alive',ru.portal_alive)
+    +'</div>';
+  // below-floor night-over-night trend strip (near top rollup)
+  const tr=d.trend||[];
+  if(tr.length){
+    let strip='';
+    for(const t of tr){
+      const pct=t.total_civs?Math.round(100*t.below_floor_count/t.total_civs):0;
+      const cls=pct>=50?' hi':(pct>=25?' mid':' lo');
+      strip+='<span class="tp'+cls+'" title="'+esc(t.sweep_date)+': '+esc(t.below_floor_count)+' of '+esc(t.total_civs)+' below 4.8 floor">'
+        +'<b>'+esc(t.sweep_date)+'</b> '+esc(t.below_floor_count)+'/'+esc(t.total_civs)+'</span>';
+    }
+    h+='<section><h2>Below-4.8-floor trend<span class="sub">night over night · below/total · watch it fall</span></h2>'
+      +'<div class="trend">'+strip+'</div></section>';
+  }
+  h+='<section><h2>Model distribution<span class="sub">live from latest sweep</span></h2><div class="dist">'+dist+'</div></section>';
+  h+=ccPanel(d.cc_crossref);
+  // below floor
+  h+='<section><h2>CC below the 4.8 floor<span class="sub">'+(d.below_floor||[]).length+' CIVs · constitutional gap</span></h2>';
+  if((d.below_floor||[]).length===0){ h+='<p class="muted" style="padding:14px 16px">None below floor in this sweep.</p>'; }
+  else{
+    h+='<table><thead><tr><th>CIV</th><th>Owner</th><th>Running model</th><th>Host</th></tr></thead><tbody>';
+    for(const c of d.below_floor){
+      h+='<tr class="clk" onclick="detail(\\''+esc(c.container||c.civ)+'\\')"><td>'+esc(c.civ)+'</td><td>'+esc(c.owner)
+        +'</td><td class="mono"><span class="pill bad">'+esc(c.running_model)+'</span></td><td class="mono">'+esc(c.host)+'</td></tr>';
+    }
+    h+='</tbody></table>';
+  }
+  h+='</section>';
+  // engagement slip
+  h+='<section><h2>Engagement-slip watchlist<span class="sub">by slip streak / days since human msg</span></h2>';
+  if((d.engagement_slip||[]).length===0){ h+='<p class="muted" style="padding:14px 16px">No engagement slip detected.</p>'; }
+  else{
+    h+='<table><thead><tr><th>CIV</th><th>Owner</th><th>Class</th><th>Slip streak</th><th>Days since human msg</th><th>BOOP</th></tr></thead><tbody>';
+    for(const c of d.engagement_slip){
+      h+='<tr class="clk" onclick="detail(\\''+esc(c.container||c.civ)+'\\')"><td>'+esc(c.civ)+'</td><td>'+esc(c.owner)+'</td><td>'+esc(c.engagement_class||'')
+        +'</td><td>'+esc(c.engagement_slip_streak)+'</td><td>'+esc(c.days_since_human_msg)+'</td><td><span class="pill '+(c.boop_cadence_ok?'ok':'bad')+'">'+(c.boop_cadence_ok?'ok':'off')+'</span></td></tr>';
+    }
+    h+='</tbody></table>';
+  }
+  h+='</section>';
+  document.getElementById('main').innerHTML=h;
+}
+function card(l,n,warn){return '<div class="card'+(warn?' warn':'')+'"><div class="n">'+(n==null?'—':n)+'</div><div class="l">'+esc(l)+'</div></div>';}
+function ccPanel(cc){
+  if(!cc) return '';
+  const ob=cc.old_binary||{count:0,civs:[]};
+  const hp=cc.hard_pinned||{count:0,civs:[]};
+  const bu=cc.binary_unknown||{count:0};
+  let s='<section><h2>Why below the 4.8 floor — binary vs config'
+    +'<span class="sub">the same 4-6 gap, split by root cause</span></h2>';
+  s+='<div class="ccwrap">';
+  // sub-section 1: needs binary upgrade
+  s+='<div class="ccsub"><h4>Needs binary upgrade ('+ob.count+')'
+    +'<span class="sub2">cc &lt; 2.1.170 — the CC binary itself is the constraint</span></h4>';
+  if(!ob.civs.length){ s+='<p class="muted" style="padding:6px 0">None.</p>'; }
+  else{
+    s+='<div class="chips">';
+    for(const c of ob.civs){
+      s+='<span class="chip" onclick="detail(\\''+esc(c.civ)+'\\')">'+esc(c.civ)
+        +' <span class="mono muted">'+esc(c.cc||'?')+'</span></span>';
+    }
+    s+='</div>';
+  }
+  s+='</div>';
+  // sub-section 2: config-pinned or stale process
+  s+='<div class="ccsub"><h4>Config-pinned or stale process ('+hp.count+') — needs resolving'
+    +'<span class="sub2">Latest binary, still 4-6 (config-pinned or stale process)</span></h4>';
+  if(!hp.civs.length){ s+='<p class="muted" style="padding:6px 0">None.</p>'; }
+  else{
+    s+='<table><thead><tr><th>CIV</th><th>Running model</th><th>CC version</th></tr></thead><tbody>';
+    for(const c of hp.civs){
+      s+='<tr class="clk" onclick="detail(\\''+esc(c.civ)+'\\')"><td>'+esc(c.civ)
+        +'</td><td class="mono"><span class="pill bad">'+esc(c.running_model)+'</span></td>'
+        +'<td class="mono">'+esc(c.cc||'?')+'</td></tr>';
+    }
+    s+='</tbody></table>';
+  }
+  s+='</div>';
+  if(bu.count){ s+='<p class="muted" style="padding:8px 16px">Binary version unknown for '+bu.count+' CIV(s) (metrics blob had no readable cc_version).</p>'; }
+  s+='</div>';
+  s+='<p class="footnote">Footnote: the "config-pinned or stale process" bucket is <b>hard-code OR stale in-memory process</b>. '
+    +'The sensor reads the <b>on-disk</b> <span class="mono">claude --version</span>; a stale long-lived process can hold an old '
+    +'binary in memory even after a disk upgrade. So this bucket is labelled "Latest binary, still 4-6 (config-pinned or stale process)".</p>';
+  s+='</section>';
+  return s;
+}
+async function detail(id){
+  const box=document.getElementById('detail'); box.classList.add('show');
+  document.getElementById('detailTitle').textContent=id;
+  document.getElementById('detailPre').textContent='loading...';
+  try{
+    const r=await fetch('/api/fleet-intel?civ='+encodeURIComponent(id),{headers:H});
+    const d=await r.json();
+    document.getElementById('detailPre').textContent=JSON.stringify(d.detail||d,null,2);
+  }catch(e){ document.getElementById('detailPre').textContent='error: '+e; }
+}
+function closeDetail(){document.getElementById('detail').classList.remove('show');}
+load();
+</script>
+</body></html>"""
+
+
+async def fleet_intel_page(request: Request) -> Response:
+    """Server-rendered fleet-intel dashboard. Auth enforced client-side via the
+    same bearer-token fetch pattern the rest of the /api routes use; the HTML
+    shell itself is static (no secrets) and all data comes from the gated
+    /api/fleet-intel endpoint."""
+    return Response(_FLEET_INTEL_HTML, media_type="text/html")
 
 
 routes = [
@@ -2336,21 +3913,50 @@ routes = [
     Route("/api/boops/{name}", endpoint=api_boop_read),
     Route("/api/margin/primary", endpoint=api_margin_primary, methods=["GET", "POST"]),
     Route("/api/margin/corey", endpoint=api_margin_corey, methods=["GET", "POST"]),
+    Route("/api/points/summary", endpoint=api_points_summary),
+    Route("/api/points/history", endpoint=api_points_history),
     Route("/webhook", endpoint=github_webhook, methods=["POST"]),
     Route("/api/deliverable", endpoint=api_deliverable, methods=["POST"]),
     Route("/api/whatsapp/qr", endpoint=api_whatsapp_qr),
     Route("/api/whatsapp/status", endpoint=api_whatsapp_status),
+    Route("/fleet-intel", endpoint=fleet_intel_page),
+    Route("/api/fleet-intel", endpoint=api_fleet_intel),
     Route("/api/evolution/status", endpoint=api_evolution_status),
     Route("/api/evolution/first-boot", endpoint=api_first_boot, methods=["POST"]),
     WebSocketRoute("/ws/chat", endpoint=ws_chat),
     WebSocketRoute("/ws/terminal", endpoint=ws_terminal),
 ]
 
-app = Starlette(routes=routes + WITNESS_ROUTES + _react_assets_mount + _vendor_mount, on_startup=[_startup])
+# ---------------------------------------------------------------------------
+# Auth-gate the Witness extension routes (/api/witness/*).
+#
+# WITNESS_ROUTES are defined in witness_extensions.py, a leaf module with no
+# access to check_auth. Left ungated, /api/witness/fleet et al. exposed every
+# CIV's portal_url (= bearer token), ssh_command, host_ip and tmux_session to
+# any unauthenticated caller — and this portal is customer-reachable. We gate
+# them HERE, where check_auth is in scope, rather than importing check_auth into
+# the leaf module (avoids a circular import). Both auth paths keep working:
+# check_auth already accepts the legacy .portal-token AND per-operator tokens.
+# Sender-attribution (resolve_operator) is untouched.
+# ---------------------------------------------------------------------------
+def _require_auth(endpoint):
+    async def _gated(request: Request):
+        if not check_auth(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return await endpoint(request)
+    return _gated
+
+
+_GATED_WITNESS_ROUTES = [
+    Route(r.path, endpoint=_require_auth(r.endpoint), methods=list(r.methods or []))
+    for r in WITNESS_ROUTES
+]
+
+app = Starlette(routes=routes + _GATED_WITNESS_ROUTES + _react_assets_mount + _vendor_mount, on_startup=[_startup])
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8097))
     print(f"[portal] Starting PureBrain Portal on port {port}")
     print(f"[portal] Bearer token: {BEARER_TOKEN}")
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info", ws_ping_interval=30, ws_ping_timeout=90)

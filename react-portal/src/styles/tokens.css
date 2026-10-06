@@ -93,6 +93,12 @@
   --terminal-connected: #3fb950;
   --terminal-disconnected: #f85149;
 
+  /* Margin — partnership journal */
+  --margin-corey-accent: #f0a500;
+  --margin-corey-accent-bg: rgba(240, 165, 0, 0.12);
+  --margin-haiku-bg: rgba(108, 92, 231, 0.06);
+  --margin-haiku-border: rgba(108, 92, 231, 0.3);
+
   /* Scrollbar */
   --scrollbar-bg: transparent;
   --scrollbar-thumb: #3a3a48;
@@ -153,6 +159,12 @@
   --terminal-border: #30363d;
   --terminal-connected: #3fb950;
   --terminal-disconnected: #f85149;
+
+  /* Margin — partnership journal */
+  --margin-corey-accent: #d99200;
+  --margin-corey-accent-bg: rgba(217, 146, 0, 0.10);
+  --margin-haiku-bg: rgba(108, 92, 231, 0.05);
+  --margin-haiku-border: rgba(108, 92, 231, 0.25);
 
   --scrollbar-bg: transparent;
   --scrollbar-thumb: #d0d0d8;

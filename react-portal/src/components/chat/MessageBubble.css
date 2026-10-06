@@ -117,12 +117,106 @@
 .msg-meta {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
   margin-top: 4px;
 }
 
 .msg-time {
   font-size: 11px;
   opacity: 0.6;
+}
+
+/* P20: which operator sent this message (legacy inline meta label — retained
+   for backward compat; the prominent per-operator chip below is the live one) */
+.msg-sender {
+  font-size: 11px;
+  font-weight: 600;
+  opacity: 0.85;
+  color: var(--accent-primary, #2f81f7);
+}
+
+/* P20 shared-conversation clarity: prominent, color-coded operator name chip at
+   the top of each user bubble so co-present operators (Corey / Russell / other)
+   instantly see WHO said what. Color comes from operatorColor() per-operator via
+   the --op-color custom property, so each operator is visually distinct AND
+   stable across every screen and session. */
+.msg-sender-chip {
+  display: inline-block;
+  align-self: flex-end;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  padding: 3px 8px;
+  margin-bottom: 6px;
+  border-radius: var(--radius-full);
+  color: #fff;
+  background: var(--op-color, var(--accent-primary, #2f81f7));
+  box-shadow: var(--shadow-sm);
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* One-click copy button — lives in the meta row so it is ALWAYS visible
+   (mobile has no hover, so this must not be hover-gated). Subtle on desktop,
+   thumb-friendly on mobile. Sits outside the text flow so it never interferes
+   with scrolling or native text selection. */
+.msg-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 6px;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  border: 1px solid transparent;
+  color: inherit;
+  opacity: 0.45;
+  cursor: pointer;
+  transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.msg-copy-btn svg {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+}
+
+.msg-copy-label {
+  font-weight: 600;
+}
+
+.msg-copy-btn:hover {
+  opacity: 1;
+  background: var(--bg-hover);
+}
+
+.msg-copy-btn-done {
+  opacity: 1;
+  color: var(--accent-primary, #2f81f7);
+}
+
+/* Mobile: enlarge to a ~40px tap target and keep it subtle-but-findable.
+   Hover doesn't exist here, so the button stays at full-enough opacity. */
+@media (max-width: 768px) {
+  .msg-copy-btn {
+    opacity: 0.6;
+    min-height: 40px;
+    min-width: 40px;
+    justify-content: center;
+    padding: 8px 10px;
+    font-size: 12px;
+  }
+  .msg-copy-btn svg {
+    width: 16px;
+    height: 16px;
+  }
 }
 
 /* Actions bar (bookmark + reactions) — anchored to bottom corner of bubble */
@@ -174,4 +268,66 @@
 .msg-reaction-btn:hover {
   transform: scale(1.3);
   background: var(--bg-hover);
+}
+
+/* BOOP prompt messages */
+.msg-row-boop .msg-bubble {
+  border-left: 3px solid #8b5cf6;
+  background: rgba(139, 92, 246, 0.08);
+}
+
+.msg-boop-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #8b5cf6;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  cursor: pointer;
+  padding: 4px 0;
+  user-select: none;
+}
+
+.msg-boop-label:hover {
+  color: #7c3aed;
+}
+
+/* Notification row — centered like system messages */
+.msg-row-notification {
+  justify-content: center;
+}
+
+/* Support request bubble */
+.msg-support {
+  background: rgba(251, 191, 36, 0.1);
+  border: 1px solid rgba(251, 191, 36, 0.3);
+  border-radius: var(--radius-lg);
+}
+
+/* System event bubble */
+.msg-system {
+  background: rgba(148, 163, 184, 0.1);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: var(--radius-lg);
+}
+
+/* Notification labels */
+.msg-notification-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  display: inline-block;
+}
+
+.msg-support-label {
+  background: rgba(251, 191, 36, 0.2);
+  color: #b45309;
+}
+
+.msg-system-label {
+  background: rgba(148, 163, 184, 0.2);
+  color: #64748b;
 }

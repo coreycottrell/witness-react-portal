@@ -3,6 +3,8 @@ export interface ChatMessage {
   text: string
   role: 'user' | 'assistant'
   timestamp: number
+  source?: string
+  sender?: string   // P20: which operator sent this (Corey / Russell / other)
   created_at?: string
   reactions?: Reaction[]
 }
