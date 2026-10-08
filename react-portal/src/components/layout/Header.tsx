@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from 'react'
 import { useIdentityStore } from '../../stores/identityStore'
 import { StatusBadge } from '../common/StatusBadge'
+import { ReconnectClaudeButton } from '../auth/ReconnectClaudeButton'
 import { apiGet } from '../../api/client'
 import { Link } from 'react-router-dom'
 import './Header.css'
@@ -79,6 +80,7 @@ export function Header() {
         <span className="header-subtitle">Portal</span>
       </div>
       <div className="header-right">
+        <ReconnectClaudeButton />
         {ctx != null && (
           <Link to="/context" className="header-ctx-link" title="Context window — click for details">
             <CtxRing pct={ctx.pct} />

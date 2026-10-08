@@ -1,3 +1,19 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════════════╗
+ * ║  WITNESS-ONLY REACT PORTAL — BESPOKE ONE-OFF                       ║
+ * ║                                                                      ║
+ * ║  THIS IS NOT THE PUREBRAIN PORTAL. NO OTHER CIV HAS OR SHOULD      ║
+ * ║  HAVE THIS CODE. DO NOT DEPLOY TO FLEET CONTAINERS. EVER.           ║
+ * ║                                                                      ║
+ * ║  The PureBrain portal that born CIVs use lives in GitHub:            ║
+ * ║    github.com/coreycottrell/purebrain-onboarding/portal/             ║
+ * ║                                                                      ║
+ * ║  This React app has Witness-specific extensions (fleet panel,        ║
+ * ║  points, margins, BOOP capture) that do not belong in fleet CIVs.  ║
+ * ║                                                                      ║
+ * ║  Corey directive 2026-03-30.                                         ║
+ * ╚══════════════════════════════════════════════════════════════════════╝
+ */
 import { lazy, Suspense, useEffect } from 'react'
 import { HashRouter, Routes, Route } from 'react-router-dom'
 // Witness extension registry — Witness-only routes layered on top of base portal

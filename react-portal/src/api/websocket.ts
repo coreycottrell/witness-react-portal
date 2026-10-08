@@ -36,7 +36,9 @@ export class ChatWebSocket {
 
     this.ws.onmessage = (event) => {
       try {
-        const msg: ChatMessage = JSON.parse(event.data)
+        const msg: ChatMessage & { type?: string } = JSON.parse(event.data)
+        // Keepalive pings carry no message payload — never render them.
+        if (msg.type === 'ping' || !msg.id) return
         this.handlers.forEach(h => h(msg))
       } catch {
         // ignore malformed messages

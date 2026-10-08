@@ -1,5 +1,6 @@
 import { useEffect, useState, useMemo, useCallback } from 'react'
 import { useChatStore } from '../../stores/chatStore'
+import { useOperatorStore } from '../../stores/operatorStore'
 import { uploadFile } from '../../api/client'
 import { MessageList } from './MessageList'
 import { ChatInput } from './ChatInput'
@@ -18,6 +19,10 @@ export function ChatView() {
   const react = useChatStore(s => s.react)
   const connectWs = useChatStore(s => s.connectWs)
   const disconnectWs = useChatStore(s => s.disconnectWs)
+  const operator = useOperatorStore(s => s.operator)
+  // P20: bind the current operator's name onto every outbound message so
+  // Primary always knows who is speaking. undefined → server falls back.
+  const sendAs = useCallback((text: string) => send(text, operator || undefined), [send, operator])
   const [showSearch, setShowSearch] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
   const [artifactContent, setArtifactContent] = useState('')
@@ -44,7 +49,7 @@ export function ChatView() {
     try {
       const res = await uploadFile(file)
       if (res.ok) {
-        send(`[Uploaded file: ${res.filename}](${res.url})`)
+        sendAs(`[Uploaded file: ${res.filename}](${res.url})`)
       }
     } catch {
       // silently fail
@@ -99,7 +104,7 @@ export function ChatView() {
         ) : (
           <MessageList messages={messages} onReact={react} highlightIds={highlightIds} onPreviewArtifact={handlePreviewArtifact} />
         )}
-        <ChatInput onSend={send} onUpload={handleUpload} sending={sending} />
+        <ChatInput onSend={sendAs} onUpload={handleUpload} sending={sending} />
       </div>
       {artifactOpen && (
         <ArtifactPanel

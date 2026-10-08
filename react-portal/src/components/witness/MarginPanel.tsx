@@ -1,63 +1,91 @@
 /**
- * MarginPanel — The Living Margin
+ * MarginPanel — The Living Margin (v3)
  *
  * A shared journal between Witness (Primary) and Corey.
- * Two voices in dialogue across time — reflections, questions,
- * course corrections. The heartbeat of the partnership.
+ * Rebuilt: single-column timeline, day grouping, pagination,
+ * collapsible long entries.
  */
-import { useEffect, useState, useCallback } from 'react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { apiGet, apiPost } from '../../api/client'
+import './witness.css'
+import { PointsSummary } from './PointsSummary'
+import { CoreyCompose } from './CoreyCompose'
+import { MarginEntry } from './MarginEntry'
 
-interface MarginEntry {
+const PAGE_SIZE = 30
+const REFRESH_INTERVAL = 60_000
+
+export interface MarginEntryData {
   timestamp: string
-  author: string
+  author: 'primary' | 'corey'
   content: string
+  boop_id?: string
 }
 
-function RelativeTime({ ts }: { ts: string }) {
-  try {
-    const d = new Date(ts)
-    const now = new Date()
-    const diffMs = now.getTime() - d.getTime()
-    const diffMins = Math.floor(diffMs / 60000)
-    const diffHrs = Math.floor(diffMs / 3600000)
-    const diffDays = Math.floor(diffMs / 86400000)
+interface DayGroup {
+  dateLabel: string
+  entries: MarginEntryData[]
+}
 
-    let relative: string
-    if (diffMins < 1) relative = 'just now'
-    else if (diffMins < 60) relative = `${diffMins}m ago`
-    else if (diffHrs < 24) relative = `${diffHrs}h ago`
-    else if (diffDays < 7) relative = `${diffDays}d ago`
-    else relative = d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+function formatDayLabel(dateStr: string): string {
+  const d = new Date(dateStr)
+  const now = new Date()
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const entry = new Date(d.getFullYear(), d.getMonth(), d.getDate())
+  const diffDays = Math.round((today.getTime() - entry.getTime()) / 86400000)
 
-    const full = d.toLocaleString(undefined, {
-      weekday: 'short', month: 'short', day: 'numeric',
-      hour: '2-digit', minute: '2-digit',
-    })
+  if (diffDays === 0) return 'Today'
+  if (diffDays === 1) return 'Yesterday'
+  if (diffDays < 7) return d.toLocaleDateString(undefined, { weekday: 'long' })
+  return d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })
+}
 
-    return <time className="margin-time" title={full}>{relative}</time>
-  } catch {
-    return <time className="margin-time">{ts}</time>
+function dateKey(ts: string): string {
+  const d = new Date(ts)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+function groupByDay(entries: MarginEntryData[]): DayGroup[] {
+  const map = new Map<string, MarginEntryData[]>()
+
+  for (const entry of entries) {
+    const key = dateKey(entry.timestamp)
+    if (!map.has(key)) map.set(key, [])
+    map.get(key)!.push(entry)
   }
+
+  const groups: DayGroup[] = []
+  for (const [, dayEntries] of map) {
+    groups.push({
+      dateLabel: formatDayLabel(dayEntries[0].timestamp),
+      entries: dayEntries,
+    })
+  }
+  return groups
 }
 
 export function MarginPanel() {
-  const [primaryEntries, setPrimaryEntries] = useState<MarginEntry[]>([])
-  const [coreyEntries, setCoreyEntries] = useState<MarginEntry[]>([])
+  const [allEntries, setAllEntries] = useState<MarginEntryData[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [newEntry, setNewEntry] = useState('')
-  const [posting, setPosting] = useState(false)
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE)
+  const [filter, setFilter] = useState<'all' | 'primary' | 'corey'>('all')
+  const composeRef = useRef<HTMLDivElement>(null)
 
   const fetchEntries = useCallback(() => {
     Promise.allSettled([
-      apiGet<MarginEntry[]>('/api/margin/primary').catch(() => []),
-      apiGet<MarginEntry[]>('/api/margin/corey').catch(() => []),
+      apiGet<MarginEntryData[]>('/api/margin/primary').catch(() => []),
+      apiGet<MarginEntryData[]>('/api/margin/corey').catch(() => []),
     ]).then(([primaryResult, coreyResult]) => {
-      setPrimaryEntries(primaryResult.status === 'fulfilled' ? primaryResult.value : [])
-      setCoreyEntries(coreyResult.status === 'fulfilled' ? coreyResult.value : [])
+      const primary = (primaryResult.status === 'fulfilled' ? primaryResult.value : [])
+        .map((e: MarginEntryData) => ({ ...e, author: 'primary' as const }))
+      const corey = (coreyResult.status === 'fulfilled' ? coreyResult.value : [])
+        .map((e: MarginEntryData) => ({ ...e, author: 'corey' as const }))
+
+      const merged = [...primary, ...corey]
+        .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+
+      setAllEntries(merged)
       setLoading(false)
     }).catch(err => {
       setError(String(err))
@@ -65,27 +93,32 @@ export function MarginPanel() {
     })
   }, [])
 
+  useEffect(() => { fetchEntries() }, [fetchEntries])
   useEffect(() => {
-    fetchEntries()
+    const timer = setInterval(fetchEntries, REFRESH_INTERVAL)
+    return () => clearInterval(timer)
   }, [fetchEntries])
 
-  const handlePost = () => {
-    const trimmed = newEntry.trim()
-    if (!trimmed || posting) return
-    setPosting(true)
-    apiPost('/api/margin/corey', { content: trimmed })
-      .then(() => {
-        setNewEntry('')
-        fetchEntries()
-      })
-      .catch(err => setError(String(err)))
-      .finally(() => setPosting(false))
+  const handlePost = async (content: string, boopId: string) => {
+    try {
+      const body: Record<string, string> = { content }
+      if (boopId && !boopId.startsWith('ts-')) {
+        body.boop_id = boopId
+      }
+      await apiPost('/api/margin/corey', body)
+      fetchEntries()
+    } catch (err) {
+      setError(String(err))
+    }
   }
 
-  const sortDesc = (entries: MarginEntry[]) =>
-    [...entries].sort((a, b) =>
-      new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
-    )
+  const filtered = filter === 'all'
+    ? allEntries
+    : allEntries.filter(e => e.author === filter)
+
+  const visible = filtered.slice(0, visibleCount)
+  const hasMore = visibleCount < filtered.length
+  const dayGroups = groupByDay(visible)
 
   if (loading) {
     return (
@@ -98,86 +131,74 @@ export function MarginPanel() {
   return (
     <div className="margin-panel">
       <header className="margin-header">
-        <h2 className="margin-title">{'\u270D\uFE0F'} The Living Margin</h2>
+        <h2 className="margin-title">The Living Margin</h2>
         <p className="margin-subtitle">A conversation across time</p>
       </header>
 
-      {error && (
-        <div className="margin-error">{error}</div>
-      )}
+      <PointsSummary />
 
-      <div className="margin-dialogue">
-        {/* Witness column */}
-        <section className="margin-voice margin-voice--witness">
-          <div className="margin-voice-label">
-            <span className="margin-voice-dot margin-voice-dot--witness" />
-            Witness
-          </div>
-          <div className="margin-entries">
-            {sortDesc(primaryEntries).length === 0 ? (
-              <div className="margin-empty">
-                Silence, for now. The first reflection has not yet been written.
+      {error && <div className="margin-error">{error}</div>}
+
+      {/* Compose */}
+      <div className="margin-compose-wrap" ref={composeRef}>
+        <CoreyCompose
+          boopRows={[]}
+          onPost={handlePost}
+          targetBoopId={undefined}
+          onTargetChange={() => {}}
+        />
+      </div>
+
+      {/* Filter bar */}
+      <div className="margin-filter-bar">
+        <div className="margin-filter-tabs">
+          {(['all', 'primary', 'corey'] as const).map(f => (
+            <button
+              key={f}
+              className={`margin-filter-tab ${filter === f ? 'margin-filter-tab--active' : ''}`}
+              onClick={() => { setFilter(f); setVisibleCount(PAGE_SIZE) }}
+            >
+              {f === 'all' ? 'All' : f === 'primary' ? 'Witness' : 'Corey'}
+              <span className="margin-filter-count">
+                {f === 'all' ? allEntries.length : allEntries.filter(e => e.author === f).length}
+              </span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Timeline */}
+      <div className="margin-timeline-v3">
+        {dayGroups.length === 0 ? (
+          <div className="margin-empty">The margin awaits its first entry.</div>
+        ) : (
+          dayGroups.map((group, gi) => (
+            <div key={gi} className="margin-day-group">
+              <div className="margin-day-header">
+                <span className="margin-day-label">{group.dateLabel}</span>
+                <span className="margin-day-line" />
               </div>
-            ) : (
-              sortDesc(primaryEntries).map((e, i) => (
-                <article key={i} className="margin-card margin-card--witness">
-                  <div className="margin-card-body">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{e.content}</ReactMarkdown>
-                  </div>
-                  <RelativeTime ts={e.timestamp} />
-                </article>
-              ))
-            )}
-          </div>
-        </section>
-
-        {/* Corey column */}
-        <section className="margin-voice margin-voice--corey">
-          <div className="margin-voice-label">
-            <span className="margin-voice-dot margin-voice-dot--corey" />
-            Corey
-          </div>
-
-          <div className="margin-compose">
-            <textarea
-              className="margin-input"
-              placeholder="What's on your mind, Corey?"
-              rows={4}
-              value={newEntry}
-              onChange={e => setNewEntry(e.target.value)}
-              onKeyDown={e => {
-                if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) handlePost()
-              }}
-            />
-            <div className="margin-compose-footer">
-              <span className="margin-hint">Ctrl+Enter to post</span>
-              <button
-                className="margin-post-btn"
-                onClick={handlePost}
-                disabled={posting || !newEntry.trim()}
-              >
-                {posting ? 'Posting...' : 'Post to Margin'}
-              </button>
+              {group.entries.map((entry, ei) => (
+                <MarginEntry
+                  key={`${entry.timestamp}-${ei}`}
+                  content={entry.content}
+                  timestamp={entry.timestamp}
+                  author={entry.author}
+                  boopId={entry.boop_id}
+                />
+              ))}
             </div>
-          </div>
+          ))
+        )}
 
-          <div className="margin-entries">
-            {sortDesc(coreyEntries).length === 0 ? (
-              <div className="margin-empty">
-                Your side of the conversation awaits.
-              </div>
-            ) : (
-              sortDesc(coreyEntries).map((e, i) => (
-                <article key={i} className="margin-card margin-card--corey">
-                  <div className="margin-card-body">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{e.content}</ReactMarkdown>
-                  </div>
-                  <RelativeTime ts={e.timestamp} />
-                </article>
-              ))
-            )}
-          </div>
-        </section>
+        {hasMore && (
+          <button
+            className="margin-load-more"
+            onClick={() => setVisibleCount(c => c + PAGE_SIZE)}
+          >
+            Load more ({filtered.length - visibleCount} remaining)
+          </button>
+        )}
       </div>
     </div>
   )

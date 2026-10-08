@@ -5,8 +5,9 @@ export function fetchChatHistory(last = 100): Promise<{ messages: ChatMessage[] 
   return apiGet<{ messages: ChatMessage[] }>(`/api/chat/history?last=${last}`)
 }
 
-export function sendChatMessage(message: string): Promise<{ ok: boolean }> {
-  return apiPost<{ ok: boolean }>('/api/chat/send', { message })
+export function sendChatMessage(message: string, sender?: string): Promise<{ ok: boolean }> {
+  // P20: include the self-selected operator so Primary sees WHO is speaking.
+  return apiPost<{ ok: boolean }>('/api/chat/send', sender ? { message, sender } : { message })
 }
 
 export function sendReaction(req: ReactionRequest): Promise<{ ok: boolean; sentiment: string }> {
