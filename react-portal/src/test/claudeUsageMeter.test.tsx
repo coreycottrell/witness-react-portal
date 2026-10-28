@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, act } from '@testing-library/react'
 import { ClaudeUsageMeter } from '../components/layout/ClaudeUsageMeter'
+import headerSrc from '../components/layout/Header.tsx?raw'
 import { usageLevel, usagePct, USAGE_POLL_MS } from '../utils/usage'
 import * as usageApi from '../api/usage'
 
@@ -91,5 +92,15 @@ describe('ClaudeUsageMeter', () => {
     await flush()
     await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
     expect(spy).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('Header placement (Russell 2026-10-28: left of Reconnect Claude)', () => {
+  it('renders the usage meter before the Reconnect Claude button', () => {
+    const meter = headerSrc.indexOf('<ClaudeUsageMeter />')
+    const reconnect = headerSrc.indexOf('<ReconnectClaudeButton />')
+    expect(meter).toBeGreaterThan(-1)
+    expect(reconnect).toBeGreaterThan(-1)
+    expect(meter).toBeLessThan(reconnect)
   })
 })

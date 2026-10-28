@@ -81,8 +81,8 @@ export function Header() {
         <span className="header-subtitle">Portal</span>
       </div>
       <div className="header-right">
-        <ReconnectClaudeButton />
         <ClaudeUsageMeter />
+        <ReconnectClaudeButton />
         {ctx != null && (
           <Link to="/context" className="header-ctx-link" title="Context window — click for details">
             <CtxRing pct={ctx.pct} />
