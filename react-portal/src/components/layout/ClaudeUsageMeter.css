@@ -1,0 +1,54 @@
+/* Claude plan usage meter in the header (5h window + weekly). Colour = thresholds in ClaudeUsageMeter.tsx. */
+.claude-usage {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 2px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 11px;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  user-select: none;
+  cursor: default;
+}
+
+.claude-usage-na {
+  opacity: 0.7;
+}
+
+.claude-usage-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  justify-content: space-between;
+}
+
+.claude-usage-text {
+  min-width: 52px;
+}
+
+.claude-usage-track {
+  display: inline-block;
+  width: 44px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border-subtle);
+  overflow: hidden;
+}
+
+.claude-usage-fill {
+  display: block;
+  height: 100%;
+  background: var(--status-success);
+  transition: width 0.6s ease, background 0.3s ease;
+}
+
+.claude-usage-warn .claude-usage-fill { background: var(--status-warning); }
+.claude-usage-warn .claude-usage-text { color: var(--status-warning); }
+.claude-usage-crit .claude-usage-fill { background: var(--status-error); }
+.claude-usage-crit .claude-usage-text { color: var(--status-error); font-weight: 700; }
+
+@media (max-width: 768px) {
+  .claude-usage-track { width: 28px; }
+  .claude-usage-text { min-width: 44px; }
+}

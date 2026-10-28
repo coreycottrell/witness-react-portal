@@ -41,6 +41,13 @@ try:
 except ImportError:
     WITNESS_ROUTES = []
 
+# Claude plan usage meter (5-hour + weekly). Optional import: if the module file
+# is ever missing the portal still boots and the meter degrades to "usage n/a".
+try:
+    import claude_usage
+except ImportError:  # pragma: no cover - defensive
+    claude_usage = None
+
 # Ensure HOME is set correctly for the aiciv user.
 # docker exec -u aiciv inherits the caller's HOME (often /root) rather than /home/aiciv.
 # Fix it here so Path.home() returns the right path throughout the server.
@@ -2041,6 +2048,28 @@ async def api_context(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+async def api_usage_claude(request: Request) -> JSONResponse:
+    """GET /api/usage/claude: Claude plan usage (5-hour window + weekly).
+
+    Server-side read of the OAuth credentials of the user running this portal, so it
+    shows PRIMARY'S account (not the viewer's). Same auth gate as /api/context.
+    Upstream failures are HTTP 200 + {"available": false, "reason": ...} so the
+    header meter degrades to "usage n/a" and the client never treats it as a
+    portal-auth failure (the shared apiFetch reloads the page on 401/403).
+    """
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if claude_usage is None:
+        return JSONResponse({"available": False, "reason": "module_missing"})
+    try:
+        result = await asyncio.to_thread(claude_usage.get_usage)
+    except Exception as exc:
+        # Class name only: an exception message could carry credential text.
+        print(f"[portal] claude usage error: {type(exc).__name__}")
+        result = {"available": False, "reason": "error"}
+    return JSONResponse(result)
+
+
 _RESUME_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 # Env knobs restart-self.sh honours for TESTING; stripped so the portal always gets production gates.
 _RESUME_TEST_ENV_KEYS = ("PROJ_BASE", "IDENTITY_FILE", "MODEL", "RESUME_MAX_BYTES", "RESUME_MIN_BYTES",
@@ -3903,6 +3932,7 @@ routes = [
     Route("/api/inject/pane", endpoint=api_inject_pane, methods=["POST"]),
     Route("/api/compact/status", endpoint=api_compact_status),
     Route("/api/context", endpoint=api_context),
+    Route("/api/usage/claude", endpoint=api_usage_claude),
     Route("/api/download", endpoint=api_download),
     Route("/api/download/list", endpoint=api_download_list),
     Route("/api/referral/dashboard", endpoint=api_referral_proxy),
