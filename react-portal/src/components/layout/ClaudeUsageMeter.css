@@ -52,3 +52,12 @@
   .claude-usage-track { width: 28px; }
   .claude-usage-text { min-width: 44px; }
 }
+
+/* Phones (390px): the header is already full (brand + Reconnect + ring + status). Drop the "Portal" subtitle and the bars,
+   keep the coloured text, so the header does not overflow (measured: +14px overflow with bars, none without). */
+@media (max-width: 480px) {
+  .header-subtitle { display: none; }
+  .claude-usage-track { display: none; }
+  .claude-usage-bar { justify-content: flex-start; }
+  .claude-usage-text { min-width: 0; }
+}
