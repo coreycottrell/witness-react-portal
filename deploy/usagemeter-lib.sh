@@ -30,12 +30,18 @@ if pid:
     for kv in open(f"/proc/{pid}/environ", "rb").read().split(b"\0"):
         if b"=" in kv:
             k, v = kv.split(b"=", 1); env[k.decode()] = v.decode()
-    os.kill(pid, signal.SIGTERM)
-    for _ in range(40):
+    # uvicorn's graceful shutdown waits on open websockets: SIGTERM, then a 2nd SIGTERM (forces exit), then SIGKILL.
+    # Safe: chat is journaled per message and delivery is confirmed by effect, so nothing in flight is lost.
+    for sig, wait in ((signal.SIGTERM, 6), (signal.SIGTERM, 6), (signal.SIGKILL, 6)):
+        try: os.kill(pid, sig)
+        except ProcessLookupError: break
+        for _ in range(wait * 2):
+            if not os.path.exists(f"/proc/{pid}"): break
+            time.sleep(0.5)
         if not os.path.exists(f"/proc/{pid}"): break
-        time.sleep(0.5)
     else:
-        sys.exit("old portal did not exit within 20s")
+        sys.exit("old portal did not exit")
+    time.sleep(0.5)
 if os.fork():
     sys.exit(0)
 os.setsid()
