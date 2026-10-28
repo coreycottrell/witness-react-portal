@@ -47,8 +47,8 @@ os.execvpe("python3", ["python3", "portal_server.py"], env)
 PY
   local i code
   for i in $(seq 1 40); do
-    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$BASE/react/" || true)
-    [ "$code" = "200" ] && { echo "restart: portal back (HTTP 200 on /react/) after ~$((i/2))s, pid $(portal_pid)"; return 0; }
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$BASE/react" || true)
+    [ "$code" = "200" ] && { echo "restart: portal back (HTTP 200 on /react) after ~$((i/2))s, pid $(portal_pid)"; return 0; }
     sleep 0.5
   done
   echo "restart: portal did NOT come back within 20s"; return 1

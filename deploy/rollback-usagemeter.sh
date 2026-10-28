@@ -12,6 +12,6 @@ rm -f "$WP/claude_usage.py"
 cp -a "$BAK/dist" "$LIVE"
 echo "files restored from $BAK (meter build kept at dist.rolledback-usagemeter-$TS)"
 if [ -z "${SKIP_RESTART:-}" ]; then
-  restart_portal && echo "post-rollback: /react/=$(http_code "$BASE/react/")"
+  restart_portal && echo "post-rollback: /react=$(http_code "$BASE/react")"
 fi
 echo ROLLED_BACK

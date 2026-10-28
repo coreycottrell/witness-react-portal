@@ -28,8 +28,8 @@ rm -rf "$R/dist.old-usagemeter-$TS"                              #    identical 
 echo "STAGED. backup: $BAK  asset: $ASSET"
 if [ -z "${SKIP_RESTART:-}" ]; then
   restart_portal || { echo "RESTART FAILED - rolling back"; "$HERE/rollback-usagemeter.sh"; exit 2; }
-  c1=$(http_code "$BASE/api/usage/claude"); c2=$(http_code "$BASE/react/")
-  echo "post-apply: /api/usage/claude (no auth)=$c1 (want 401), /react/=$c2 (want 200)"
+  c1=$(http_code "$BASE/api/usage/claude"); c2=$(http_code "$BASE/react")
+  echo "post-apply: /api/usage/claude (no auth)=$c1 (want 401), /react=$c2 (want 200)"
   if [ "$c1" != 401 ] || [ "$c2" != 200 ]; then echo "POST-CHECK FAILED - rolling back"; "$HERE/rollback-usagemeter.sh"; exit 2; fi
 fi
 echo APPLIED
