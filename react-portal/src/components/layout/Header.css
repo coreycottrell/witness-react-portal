@@ -1,4 +1,6 @@
 .header {
+  position: relative;
+  z-index: 30;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -73,4 +75,30 @@
   .header {
     padding: 0 12px;
   }
+}
+
+/* ── Phones / small landscape (<= 780px): two rows ─────────────────────────────────────────
+   Row 1 = brand, Reconnect, context ring, status dot (the original header, which fits a 360px phone).
+   Row 2 = the Claude account + usage strip (ClaudeUsageMeter.css puts it on its own full-width row).
+   Header-right is flattened (display: contents) so the strip can wrap below instead of being squeezed. */
+@media (max-width: 780px) {
+  .header {
+    height: auto;
+    min-height: var(--header-height);
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    align-content: flex-start;
+    column-gap: 12px;
+    row-gap: 0;
+  }
+  .header-left { min-height: var(--header-height); align-items: center; }
+  .header-right { display: contents; }
+  .header .reconnect-claude-btn { margin-left: auto; }
+}
+
+@media (max-width: 480px) {
+  .header { column-gap: 8px; }
+  .header-subtitle { display: none; }
+  /* the status LABEL goes; the dot (and its colour) stays, the full word is in its title */
+  .header .status-label { display: none; }
 }

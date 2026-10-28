@@ -8,7 +8,7 @@ interface StatusBadgeProps {
 
 export function StatusBadge({ status, label }: StatusBadgeProps) {
   return (
-    <span className={cn('status-badge', `status-${status}`)}>
+    <span className={cn('status-badge', `status-${status}`)} title={label}>
       <span className="status-dot" />
       {label && <span className="status-label">{label}</span>}
     </span>

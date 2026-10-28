@@ -1,20 +1,91 @@
-/* Claude plan usage meter in the header (5h window + weekly). Colour = thresholds in ClaudeUsageMeter.tsx. */
+/* Claude account + plan usage meter in the header (5h window + weekly).
+   Colour of the % text and bar = thresholds in utils/usage.ts. Account block = which Claude login is active.
+   Desktop: a compact two-line block left of the Reconnect button. Phones (<= 780px): the meter becomes its own
+   full-width strip under the header row (see Header.css), so it can never be squeezed off-screen or shrunk to
+   unreadable (the 10px grey text of the first version, measured below 4.5:1 contrast, was the phone defect). */
+
+.claude-usage-wrap {
+  position: relative;
+  display: inline-flex;
+  min-width: 0;
+  /* amber / red for TEXT must read on the header background: the shared status tokens are fine on dark, too pale on white */
+  --cu-warn: var(--status-warning);
+  --cu-crit: var(--status-error);
+}
+[data-theme="light"] .claude-usage-wrap {
+  --cu-warn: #8a5a00;
+  --cu-crit: #b3261e;
+}
+
+/* button reset: the whole meter is one tap/click target that opens the details */
 .claude-usage {
+  appearance: none;
+  -webkit-appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  margin: 0;
+  padding: 4px 8px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  text-align: left;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.claude-usage:hover { background: var(--bg-hover); }
+.claude-usage:focus-visible { outline: 2px solid var(--accent-primary); outline-offset: 1px; }
+
+span.claude-usage { cursor: default; }  /* the "usage..." placeholder is not interactive */
+.claude-usage-na { opacity: 0.85; }
+
+/* ── account block ── */
+.claude-usage-account {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  max-width: 190px;
+}
+.claude-usage-email {
+  font-size: 11px;
+  line-height: 16px;            /* roomy: overflow:hidden (for the ellipsis) must not clip ascenders */
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.claude-usage-plan {
+  font-size: 11px;
+  line-height: 14px;
+  color: var(--text-secondary);
+  opacity: 0.85;
+}
+.claude-usage-account[data-state="unknown"] .claude-usage-email {
+  color: var(--cu-warn);
+  font-style: italic;
+}
+.claude-usage-account[data-state="changed"] .claude-usage-email { color: var(--cu-warn); }
+.claude-usage-changed {
+  color: var(--cu-warn);
+  font-weight: 700;
+  opacity: 1;
+}
+
+/* ── usage bars ── */
+.claude-usage-bars {
   display: inline-flex;
   flex-direction: column;
   gap: 2px;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  line-height: 11px;
-  color: var(--text-tertiary);
-  white-space: nowrap;
-  user-select: none;
-  cursor: default;
 }
-
-.claude-usage-na {
-  opacity: 0.7;
-}
+.claude-usage-bars-na { color: var(--text-secondary); }
+.claude-usage-bars-stale { opacity: 0.75; font-style: italic; }   /* last good reading while the usage API is busy */
 
 .claude-usage-bar {
   display: inline-flex;
@@ -22,42 +93,101 @@
   gap: 6px;
   justify-content: space-between;
 }
-
 .claude-usage-text {
   min-width: 52px;
+  color: var(--text-secondary);
 }
-
 .claude-usage-track {
   display: inline-block;
   width: 44px;
   height: 4px;
   border-radius: 2px;
-  background: var(--border-subtle);
+  background: var(--border-default);
   overflow: hidden;
 }
-
 .claude-usage-fill {
   display: block;
   height: 100%;
   background: var(--status-success);
   transition: width 0.6s ease, background 0.3s ease;
 }
+.claude-usage-warn .claude-usage-fill { background: var(--cu-warn); }
+.claude-usage-warn .claude-usage-text { color: var(--cu-warn); }
+.claude-usage-crit .claude-usage-fill { background: var(--cu-crit); }
+.claude-usage-crit .claude-usage-text { color: var(--cu-crit); font-weight: 700; }
 
-.claude-usage-warn .claude-usage-fill { background: var(--status-warning); }
-.claude-usage-warn .claude-usage-text { color: var(--status-warning); }
-.claude-usage-crit .claude-usage-fill { background: var(--status-error); }
-.claude-usage-crit .claude-usage-text { color: var(--status-error); font-weight: 700; }
+/* ── details popover ── */
+.claude-usage-pop {
+  position: absolute;
+  z-index: 60;
+  top: calc(100% + 10px);
+  right: 0;
+  width: 320px;
+  max-width: calc(100vw - 16px);
+  padding: 12px 14px;
+  background: var(--surface-modal);
+  border: 1px solid var(--border-default);
+  border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  max-height: calc(100vh - 84px);      /* short landscape screens: scroll inside the card instead of running off-screen */
+  max-height: calc(100dvh - 84px);
+  overflow-y: auto;
+  font-family: var(--font-body, inherit);
+  font-size: 13px;
+  line-height: 18px;
+  color: var(--text-primary);
+  white-space: normal;
+}
+.claude-usage-pop-row { display: flex; gap: 10px; padding: 3px 0; }
+.claude-usage-pop-k { flex: 0 0 88px; color: var(--text-secondary); }
+.claude-usage-pop-v { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.claude-usage-pop-change {
+  margin: 6px 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--status-warning-bg);
+  color: var(--cu-warn);
+}
+.claude-usage-ack {
+  margin-left: 8px;
+  padding: 4px 10px;
+  border: 1px solid var(--cu-warn);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--cu-warn);
+  font-size: 12px;
+  cursor: pointer;
+}
+.claude-usage-pop-foot { margin-top: 6px; font-size: 12px; color: var(--text-secondary); }
 
-@media (max-width: 768px) {
-  .claude-usage-track { width: 28px; }
-  .claude-usage-text { min-width: 44px; }
+/* ── phones and small landscape (<= 780px): its own full-width strip, laid out by Header.css ── */
+@media (max-width: 780px) {
+  .claude-usage-wrap { position: static; display: flex; flex: 0 0 100%; order: 9; padding-bottom: 6px; }
+  .claude-usage {
+    width: 100%;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 5px 8px;
+    border-color: var(--border-subtle);
+    font-size: 11px;
+    line-height: 13px;
+  }
+  .claude-usage-account { flex-direction: row; align-items: baseline; gap: 6px; flex: 1 1 auto; max-width: none; }
+  .claude-usage-email { font-size: 12px; line-height: 17px; min-width: 0; flex: 0 1 auto; }
+  .claude-usage-plan { font-size: 11px; line-height: 17px; flex: 0 0 auto; white-space: nowrap; }
+  .claude-usage-bars { flex: 0 0 auto; flex-direction: row; gap: 12px; }
+  .claude-usage-bar { gap: 5px; }
+  .claude-usage-text { min-width: 0; font-size: 11px; }
+  .claude-usage-track { width: 26px; }
+  .claude-usage-pop { left: 8px; right: 8px; width: auto; max-width: none; top: 100%; max-height: calc(100vh - 100px); max-height: calc(100dvh - 100px); }
 }
 
-/* Phones (390px): the header is already full (brand + Reconnect + ring + status). Drop the "Portal" subtitle and the bars,
-   keep the coloured text, so the header does not overflow (measured: +14px overflow with bars, none without). */
+/* Narrow phones (<= 480px): the e-mail is what matters, so it gets the room. The plan label moves to the details
+   (tap), and "account changed" becomes an amber warning sign in front of the e-mail instead of a second label. */
 @media (max-width: 480px) {
-  .header-subtitle { display: none; }
-  .claude-usage-track { display: none; }
-  .claude-usage-bar { justify-content: flex-start; }
-  .claude-usage-text { min-width: 0; }
+  .claude-usage-plan { display: none; }
+  .claude-usage-account[data-state="changed"] .claude-usage-email { font-weight: 700; }
+  .claude-usage-account[data-state="changed"] .claude-usage-email::before { content: "\26A0\FE0E\00a0"; }
+  .claude-usage-bars { gap: 10px; }
+  .claude-usage-track { width: 22px; }
 }
